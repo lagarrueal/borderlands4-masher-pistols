@@ -1,0 +1,13 @@
+# packaged output
+dist/
+
+__pycache__/
+*.pyc
+
+# extracted game data - large, and not ours to redistribute
+*.ncs
+*.bin
+*.pak
+*.ucas
+*.utoc
+_trace_*.txt

@@ -1,0 +1,10 @@
+[project]
+name = "jakobs_masher"
+version = "1.0"
+authors = [{ name = "Claude" }]
+description = "Adds BL3-style Masher revolvers: some Jakobs pistols fire a burst of projectiles per shot instead of a single slug, each hitting for a fraction of card damage."
+
+[tool.sdkmod]
+name = "Jakobs Masher"
+version = "1.0"
+coop_support = "HostOnly"
