@@ -30,6 +30,7 @@ from mods_base import (
     SliderOption,
     build_mod,
     command,
+    get_pc,
     hook,
     keybind,
 )
@@ -132,6 +133,20 @@ masher_frequency = SliderOption(
     ),
 )
 
+player_weapons_only = BoolOption(
+    "Player Weapons Only",
+    True,
+    "On",
+    "Off",
+    display_name="Player Weapons Only",
+    description=(
+        "Only convert guns you are carrying. The sweep sees every weapon actor"
+        " in the level, enemies included, and a Masher in enemy hands is a"
+        " 2.4x damage enemy. Turn off to convert every Jakobs revolver in the"
+        " world."
+    ),
+)
+
 verbose_logging = BoolOption(
     "Verbose Logging",
     False,
@@ -145,15 +160,50 @@ verbose_logging = BoolOption(
 # --------------------------------------------------------------------------- #
 # Runtime discovery
 #
-# The exact property that carries a weapon's identity is not documented
-# anywhere, so it is discovered once from the first weapon seen and cached.
+# BL4's weapon definitions live in Nexus `.ncs` data, not in UObjects, so a
+# weapon actor does not necessarily carry its type name as a directly readable
+# property - the first in-game run found none at all. What it does carry are
+# references to UE *assets* whose paths are named after the weapon:
+# `Body_JAK_PS`, `TriggerFB_JAK_PS`, `/Game/Gear/Weapons/Pistols/JAK/...`.
+# Those sit one or two hops away, so identity is gathered by walking the
+# weapon's object graph rather than by reading one known property.
 # --------------------------------------------------------------------------- #
 
-# Property names on a weapon whose value mentions a MANUFACTURER_CLASS tag.
-_identity_props: list[str] | None = None
+# How far to walk, and how many objects to touch, when identifying a weapon.
+# Generous enough to reach a mesh or a data asset, bounded so a stray reference
+# into the world cannot turn this into a full object-graph crawl.
+IDENTITY_MAX_DEPTH = 3
+IDENTITY_MAX_NODES = 250
+
+# Links that lead *away* from the weapon - up to its owner, the world, the
+# player. Following them would escape the weapon entirely.
+IDENTITY_SKIP_FIELDS = frozenset(
+    {
+        "Outer",
+        "Class",
+        "Owner",
+        "Instigator",
+        "World",
+        "Level",
+        "GameInstance",
+        "PlayerState",
+        "Pawn",
+        "Controller",
+        "WeaponUser",
+        "AttachParent",
+        "Parent",
+    }
+)
+
+# Vehicle turrets are weapons too, and are not what this mod is about.
+IGNORED_WEAPON_CLASSES = ("VehicleWeapon",)
 
 # True once we know whether OakWeapon.GetPartValue can be called.
 _part_values_work: bool | None = None
+
+# Weapon address -> the strings its object graph yielded. Walking the graph is
+# not free, so it happens once per weapon.
+_identity_cache: dict[int, list[str]] = {}
 
 
 def _describe(value: Any) -> str:
@@ -164,49 +214,228 @@ def _describe(value: Any) -> str:
         return ""
 
 
-def _discover_identity_props(weapon: UObject) -> list[str]:
-    """Find the properties on a weapon that name its manufacturer and class."""
-    found: list[str] = []
-    for name in dir(weapon):
-        if name.startswith("_"):
-            continue
+def _as_object(value: Any) -> UObject | None:
+    """Return the value if it is walkable - an unreal object or struct.
+
+    Both answer `_get_address`; only objects answer `_path_name`, which the
+    caller handles.
+    """
+    if isinstance(value, (str, bytes, bool, int, float)) or value is None:
+        return None
+    try:
+        value._get_address()
+    except Exception:
+        return None
+    return value
+
+
+# Arrays of parts, components or materials are exactly where a weapon's assets
+# tend to live, so they get walked too - bounded, like everything else here.
+MAX_ARRAY_ELEMENTS = 32
+
+
+def _elements(value: Any) -> list[Any]:
+    """The items of an unreal array, or the value itself if it is not one."""
+    if isinstance(value, (str, bytes)) or value is None:
+        return [value]
+    try:
+        length = len(value)
+    except Exception:
+        return [value]
+    try:
+        return [value[i] for i in range(min(length, MAX_ARRAY_ELEMENTS))]
+    except Exception:
+        return [value]
+
+
+def collect_identity(weapon: UObject) -> list[str]:
+    """Walk the weapon's object graph, collecting every string it reaches.
+
+    Breadth-first so the closest references - the ones most likely to name the
+    weapon - are seen first, and bounded on both depth and total objects.
+    """
+    cached = _identity_cache.get(weapon._get_address())
+    if cached is not None:
+        return cached
+
+    strings: list[str] = []
+    seen: set[int] = set()
+    queue: list[tuple[UObject, int]] = [(weapon, 0)]
+
+    while queue and len(seen) < IDENTITY_MAX_NODES:
+        obj, depth = queue.pop(0)
+
         try:
-            value = getattr(weapon, name)
+            address = obj._get_address()
         except Exception:
             continue
-        # Skip callables - we only want data.
-        if isinstance(value, BoundFunction):
+        if address in seen:
             continue
-        if WEAPON_TAG_RE.search(_describe(value)):
-            found.append(name)
-    return found
+        seen.add(address)
+
+        try:
+            strings.append(obj._path_name())
+        except Exception:
+            pass
+
+        if depth >= IDENTITY_MAX_DEPTH:
+            continue
+
+        try:
+            fields = dir(obj)
+        except Exception:
+            continue
+
+        for name in fields:
+            if name.startswith("_") or name in IDENTITY_SKIP_FIELDS:
+                continue
+            try:
+                value = getattr(obj, name)
+            except Exception:
+                continue
+            if isinstance(value, BoundFunction):
+                continue
+
+            child = _as_object(value)
+            if child is not None:
+                # Objects and structs both answer `_get_address`, and both can
+                # be walked into - a struct field is as likely to hold the
+                # asset reference as an object property is.
+                queue.append((child, depth + 1))
+                continue
+
+            for element in _elements(value):
+                nested = _as_object(element)
+                if nested is not None:
+                    queue.append((nested, depth + 1))
+                else:
+                    text = _describe(element)
+                    if text:
+                        strings.append(text)
+
+    _identity_cache[weapon._get_address()] = strings
+    return strings
 
 
 def weapon_identity(weapon: UObject) -> str:
-    """A string naming this weapon's manufacturer and class, e.g. 'JAK_PS'."""
-    global _identity_props
+    """Everything the weapon's object graph says about what it is."""
+    return " ".join(collect_identity(weapon))
 
-    if _identity_props is None:
-        _identity_props = _discover_identity_props(weapon)
-        if _identity_props:
-            log(f"identifying weapons via {', '.join(_identity_props)}")
-        else:
-            log(
-                "could not find any property naming a weapon's type -"
-                " falling back to the object path"
-            )
 
-    chunks = [weapon._path_name()]
-    for name in _identity_props:
-        try:
-            chunks.append(_describe(getattr(weapon, name)))
-        except Exception:
-            continue
-    return " ".join(chunks)
+def is_ignored_weapon(weapon: UObject) -> bool:
+    try:
+        name = weapon.Class.Name
+    except Exception:
+        return False
+    return any(ignored in name for ignored in IGNORED_WEAPON_CLASSES)
 
 
 def is_jakobs_pistol(weapon: UObject) -> bool:
-    return TARGET_WEAPON_TAG.lower() in weapon_identity(weapon).lower()
+    """Does this weapon's graph name it as a Jakobs pistol?
+
+    Two spellings appear in the data: the explicit `JAK_PS` tag, used by the
+    NCS records and by asset names like `Body_JAK_PS` or `TriggerFB_JAK_PS`,
+    and the directory the assets live in, `/Game/Gear/Weapons/Pistols/JAK/`.
+
+    The tag wins whenever one is present. A weapon can legitimately reference
+    assets belonging to another weapon - a shared or licensed part - so the
+    directory is only trusted when the graph carries no tag at all to judge by.
+    """
+    if is_ignored_weapon(weapon):
+        return False
+
+    identity = collect_identity(weapon)
+
+    tags = {
+        match.group(0).upper()
+        for text in identity
+        for match in WEAPON_TAG_RE.finditer(text)
+    }
+    if tags:
+        return TARGET_WEAPON_TAG in tags
+
+    return any("weapons/pistols/jak" in text.lower() for text in identity)
+
+
+# Properties that might link a weapon back to whoever is holding it. Which one
+# BL4 actually uses is unconfirmed, so all are tried and the winner is logged.
+OWNER_FIELDS = ("WeaponUser", "Owner", "Instigator", "BodyOwner")
+
+_ownership_field: str | None = None
+_ownership_warned = False
+
+
+def _player_objects() -> set[int]:
+    """Addresses that count as 'the local player'."""
+    addresses: set[int] = set()
+    try:
+        pc = get_pc()
+    except Exception:
+        return addresses
+    if pc is None:
+        return addresses
+
+    for candidate in (pc,):
+        try:
+            addresses.add(candidate._get_address())
+        except Exception:
+            pass
+    for field in ("Pawn", "AcknowledgedPawn", "Character", "PlayerState"):
+        try:
+            obj = getattr(pc, field)
+        except Exception:
+            continue
+        if obj is None:
+            continue
+        try:
+            addresses.add(obj._get_address())
+        except Exception:
+            continue
+    return addresses
+
+
+def is_player_weapon(weapon: UObject) -> bool | None:
+    """Is this weapon held by the local player?
+
+    Returns None when it cannot be determined - none of the candidate owner
+    links exist - so the caller can decide what to do rather than silently
+    treating an unknown as a no.
+    """
+    global _ownership_field
+
+    targets = _player_objects()
+    if not targets:
+        return None
+
+    saw_a_link = False
+    for field in OWNER_FIELDS:
+        try:
+            owner = getattr(weapon, field)
+        except Exception:
+            continue
+        if owner is None:
+            continue
+        saw_a_link = True
+
+        # The holder may be a component or body rather than the pawn itself,
+        # so follow a couple of Owner hops upward.
+        node = owner
+        for _ in range(4):
+            try:
+                if node._get_address() in targets:
+                    if _ownership_field != field:
+                        _ownership_field = field
+                        log(f"player weapons identified via '{field}'")
+                    return True
+                node = node.Owner
+            except Exception:
+                break
+            if node is None:
+                break
+
+    # A link existed but led somewhere else: definitely not ours. No link at
+    # all: we genuinely cannot tell.
+    return False if saw_a_link else None
 
 
 def part_values(weapon: UObject) -> tuple[int, ...]:
@@ -383,6 +612,7 @@ def restore_all() -> None:
         restored += 1
     _touched.clear()
     _weapon_cache.clear()
+    _identity_cache.clear()
     if restored:
         log(f"restored {restored} weapon(s)")
 
@@ -496,6 +726,21 @@ def process_weapon(weapon: UObject, known: list[UObject] | None = None) -> None:
     if not is_jakobs_pistol(weapon):
         _weapon_cache[address] = (path, [], False)
         return
+
+    if player_weapons_only.value:
+        global _ownership_warned
+        owned = is_player_weapon(weapon)
+        if owned is False:
+            debug(f"{path} is a Jakobs revolver, but not ours")
+            _weapon_cache[address] = (path, [], False)
+            return
+        if owned is None and not _ownership_warned:
+            _ownership_warned = True
+            log(
+                "cannot tell who owns a weapon - converting all of them,"
+                " enemies included. Turn off 'Player Weapons Only' to silence"
+                " this, or report it."
+            )
 
     behaviours = known if known is not None else fire_behaviours_of(weapon)
     if not behaviours:
@@ -634,8 +879,9 @@ def scan_keybind() -> None:
 @command("masher", description="Inspect what Jakobs Masher is doing.")
 def masher_command(args: Any) -> None:
     if args.action == "status":
-        log(f"identity properties: {_identity_props}")
+        log(f"weapons identified: {len(_identity_cache)}")
         log(f"GetPartValue usable: {_part_values_work}")
+        log(f"ownership link: {_ownership_field or 'not established'}")
         log("hook activity:")
         for hook_obj in HOOKS:
             for func_name, _hook_type in hook_obj.hook_funcs:
@@ -658,13 +904,15 @@ def masher_command(args: Any) -> None:
         restore_all()
         return
 
-    # dump - everything we can see about the currently held weapon.
+    # dump - everything we can see about every live weapon, with the strings
+    # its object graph yielded. When identification fails this is the evidence.
     behaviours = [
         b
         for b in unrealsdk.find_all(FIRE_BEHAVIOUR_CLASS, False)
         if b != b.Class.ClassDefaultObject
     ]
     log(f"{len(behaviours)} live {FIRE_BEHAVIOUR_CLASS} object(s)")
+
     for behaviour in behaviours[:8]:
         log(f"--- {behaviour._path_name()}")
         for field in (
@@ -680,19 +928,56 @@ def masher_command(args: Any) -> None:
             except Exception as exc:
                 log(f"      {field} unreadable ({exc})")
 
-        outer = behaviour
-        for depth in range(6):
+        weapon = owning_weapon(behaviour)
+        if weapon is None:
+            log("      no owning weapon found")
+            continue
+
+        try:
+            class_name = weapon.Class.Name
+        except Exception:
+            class_name = "?"
+        log(f"      weapon   = {class_name} {weapon._path_name()}")
+
+        identity = collect_identity(weapon)
+        log(f"      graph    = {len(identity)} string(s)")
+
+        tagged = [s for s in identity if WEAPON_TAG_RE.search(s)]
+        gear = [s for s in identity if "/game/gear/" in s.lower()]
+
+        if tagged:
+            log("      MANUFACTURER/CLASS TAGS:")
+            for text in tagged[:10]:
+                log(f"        {text[:200]}")
+        else:
+            log("      no MANUFACTURER_CLASS tag anywhere in the graph")
+
+        if gear:
+            log("      gear asset paths:")
+            for text in gear[:10]:
+                log(f"        {text[:200]}")
+
+        if not tagged and not gear:
+            log("      sample of what the graph did contain:")
+            for text in identity[:25]:
+                log(f"        {text[:160]}")
+
+        owner_links = []
+        for field in OWNER_FIELDS:
             try:
-                outer = outer.Outer
+                owner = getattr(weapon, field)
             except Exception:
-                break
-            if outer is None:
-                break
-            log(f"      outer[{depth}] = {outer.Class.Name} {outer._path_name()}")
-            if outer.Class.Name.endswith("Weapon"):
-                log(f"      identity = {weapon_identity(outer)[:400]}")
-                log(f"      parts    = {part_values(outer)}")
-                break
+                continue
+            if owner is None:
+                continue
+            try:
+                owner_links.append(f"{field}={owner.Class.Name} {owner._path_name()}")
+            except Exception:
+                owner_links.append(f"{field}={_describe(owner)[:120]}")
+        log(f"      owner    = {'; '.join(owner_links) or 'no owner link found'}")
+        log(f"      mine     = {is_player_weapon(weapon)}")
+        log(f"      jakobs pistol = {is_jakobs_pistol(weapon)}")
+        log(f"      parts    = {part_values(weapon)}")
 
 
 masher_command.add_argument(

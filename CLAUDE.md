@@ -121,22 +121,73 @@ clobbered.
 
 ## How the mod works
 
-Hooks `Weapon:ServerStartUsing` (plus equip and reload), finds the
-`WeaponBehavior_FireProjectile` under the weapon's `Outer` chain, and sets
+Finds the `WeaponBehavior_FireProjectile` belonging to a weapon and sets
 `ProjectilesPerShot`, scaling `Damage` and `Spread`.
 
 `WeaponBehavior` instances are **per weapon**, not shared per weapon type —
 they carry replicated state (`OnRep_ChargeState`, `ServerSyncedLoadedAmmo`,
 `StoredAmmo`), so writing to one affects that gun only.
 
-Two things are discovered at runtime rather than hardcoded, because they could
-not be confirmed offline. Both log what they picked, and `masher dump` shows
-everything if they fail:
+### Which triggers actually fire — measured
 
-- **Which property identifies a gun's type.** Scans the weapon's properties for
-  a `MANUFACTURER_CLASS` tag (`JAK_PS`, `BOR_SG`, …) once, then caches the names.
-- **Whether `OakWeapon.GetPartValue` is callable.** It supplies the part indices
-  the Masher roll is keyed on. Falls back to a fingerprint of rolled stats.
+Of the five hooks, **only `Weapon:PlayEffects` has been observed firing**
+(12 times in one session). All three `Server*` RPCs and
+`OakCharacter:ClientSetActiveWeaponEquipSlot` bound successfully and fired
+**zero** times:
+
+```
+ServerStartUsing                   bound=True  fired=0
+ServerEquipInterruptible           bound=True  fired=0
+ServerStartReloading               bound=True  fired=0
+PlayEffects                        bound=True  fired=12
+ClientSetActiveWeaponEquipSlot     bound=True  fired=0
+```
+
+`bound=True fired=0` means BL4 resolves that path in native C++ rather than
+through the script VM, so unrealsdk's ProcessEvent hook never sees it. Do not
+assume a reflection-resolved function name implies a reachable hook — the name
+being real is necessary, not sufficient.
+
+This is why `scan_all()` exists: a hook-independent sweep, reachable from the
+**Scan Weapons Now** keybind and `masher scan`, that walks every live fire
+behaviour up to its weapon via `owning_weapon()`.
+
+### Identity is not a property — it is a graph walk
+
+The first run reported `could not find any property naming a weapon's type`
+and `identity properties: []`. Scanning the weapon's own properties for a
+`JAK_PS`-style tag finds **nothing**, because weapon definitions are NCS data,
+not UObjects. The weapon actor holds no type name; what it holds are
+references to *assets* named after the weapon, one or more hops away —
+`Body_JAK_PS`, `TriggerFB_JAK_PS`, `/Game/Gear/Weapons/Pistols/JAK/...`.
+
+`collect_identity()` therefore walks the weapon's object graph breadth-first,
+bounded at `IDENTITY_MAX_DEPTH` (3) and `IDENTITY_MAX_NODES` (250), following
+object *and struct* fields (both answer `_get_address`; only objects answer
+`_path_name`) plus array elements, and skipping `IDENTITY_SKIP_FIELDS` — the
+upward links (`Outer`, `Owner`, `World`, `Pawn`, …) that would otherwise escape
+into the whole level.
+
+`is_jakobs_pistol()` then prefers the **explicit tag** whenever the graph
+carries any `MANUFACTURER_CLASS` tag at all, and only falls back to the
+`weapons/pistols/jak` directory when there is no tag to judge by. A weapon can
+legitimately reference another weapon's assets — shared or licensed parts — so
+OR-ing the two signals misidentifies Jakobs shotguns. Tests cover that case.
+
+**Bug this replaced:** identity discovery used to cache the winning property
+names globally on first use. The live scan hits `OakVehicleWeapon` turrets
+first, which legitimately have no tag, so the negative result was cached
+permanently and every later weapon failed. Discovery must never cache a
+negative derived from one sample.
+
+### Enemies hold weapons too
+
+`scan_all()` sees every weapon actor in the level. Converting them all makes
+enemy Jakobs revolvers 2.4× damage, so `player_weapons_only` (default on)
+filters by ownership, trying `WeaponUser`, `Owner`, `Instigator`, `BodyOwner`
+and following a few `Owner` hops to the pawn. `is_player_weapon()` returns
+`None` — not `False` — when no owner link exists at all, so an unknown is not
+silently treated as an enemy; the caller converts anyway and warns once.
 
 ### Re-basing, not pinning
 
@@ -164,27 +215,43 @@ grep -i masher OakGame/Binaries/Win64/Plugins/unrealsdk.log
 Log timestamps are **UTC**; local here is UTC+2, so an entry that looks two
 hours stale is current.
 
-Everything the mod does is now self-reporting, because guessing cost a session:
+Everything the mod does is self-reporting, because guessing has cost two
+sessions now:
 
 - `on_enable` prints the active settings and which hooks bound
 - every hook counts itself and announces its first call
-- `masher status` prints the bound/fired table
-- `masher scan` and the **Scan Weapons Now** keybind sweep every loaded weapon
-  without any hook, via `scan_all()` → `owning_weapon()`
+- `masher status` prints the bound/fired table, the ownership link, and
+  how many weapons have been identified
+- `masher dump` prints, per live weapon: its class and path, how many strings
+  its graph yielded, every `MANUFACTURER_CLASS` tag found, every
+  `/Game/Gear/` asset path, its owner links, and — when neither turns up —
+  a raw sample of what the graph *did* contain
 
-`bound=True fired=0` after real gameplay means BL4 resolves that path natively
-rather than through the script VM, and unrealsdk's ProcessEvent hook never sees
-it. That is why there are five triggers and a manual sweep rather than one hook.
+## Settled, and still open
 
-## What is not verified
+66 passing tests against a fake engine, plus two in-game sessions.
 
-The logic has 26 passing tests against a fake engine. The **live object graph
-has not been confirmed in game**. Specifically:
+**Settled in game:**
 
-- whether a weapon exposes a property naming its type (the `BodyData` the tests
-  assume is a plausible stand-in, not an observed value)
-- whether `Damage` stays where it is written between shots, or is recomputed
-  fast enough that six full-damage projectiles come out
+| Question | Answer |
+|---|---|
+| Does the mod load and bind? | Yes — all five hooks bind |
+| Which trigger fires? | `PlayEffects` only; the `Server*` RPCs never do |
+| Does `scan_all()` reach weapons? | Yes — 6–10 `OakWeapon` actors per sweep |
+| Does a weapon carry its type as a property? | **No** — hence the graph walk |
+| Does `owning_weapon()` work? | Yes — behaviours resolve to their actor |
 
-Both fail visibly rather than silently, and `masher dump` was written to answer
-them in one run.
+**Still open:**
+
+- **Whether the graph walk finds the tag.** It is the fix for the one confirmed
+  blocker, but the depth, node cap and skip-list are reasoned, not measured.
+  `masher dump` prints the graph's tags, gear paths, and a raw sample when
+  neither turns up — that names the fix in one run.
+- **Which property links a weapon to its holder.** Four candidates are tried;
+  the winner is logged and shown in `masher status`. Until one matches,
+  ownership is undecidable and everything converts, with a warning.
+- **Whether `Damage` stays where it is written** between shots, or is recomputed
+  fast enough that six full-damage projectiles come out. Visible immediately if
+  wrong.
+- `PlayEffects` has only been observed firing for `OakVehicleWeapon` turrets, so
+  it is not yet confirmed to fire for player guns. The keybind covers this.

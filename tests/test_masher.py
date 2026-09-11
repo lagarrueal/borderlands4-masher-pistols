@@ -26,12 +26,25 @@ def check(label: str, cond: bool, extra: str = "") -> None:
         FAILS.append(label)
 
 
+# The game lays assets out by weapon class, then manufacturer.
+CLASS_DIRS = {
+    "PS": "Pistols",
+    "SG": "Shotguns",
+    "AR": "AssaultRifles",
+    "SM": "SMG",
+    "SR": "Sniper",
+    "HW": "Heavy",
+}
+
+
 def make_weapon(tag: str, parts: tuple[int, ...], damage=100.0, spread=1.0):
     """A weapon actor plus the fire behaviour hanging off it."""
+    manufacturer, weapon_class = tag.split("_")
+    directory = f"{CLASS_DIRS[weapon_class]}/{manufacturer}"
     weapon = env.FakeObject(
         "OakWeapon",
         path=f"World.{tag}_{env._NEXT_ADDR[0]}",
-        BodyData=f"/Game/Gear/Weapons/Pistols/JAK/Body_{tag}.Body_{tag}",
+        BodyData=f"/Game/Gear/Weapons/{directory}/Body_{tag}.Body_{tag}",
         CurrentUseModeIndex=0,
     )
     # GetPartValue: the engine exposes it as a callable property.
@@ -59,8 +72,10 @@ def make_weapon(tag: str, parts: tuple[int, ...], damage=100.0, spread=1.0):
 def reset_mod() -> None:
     jm._touched.clear()
     jm._weapon_cache.clear()
-    jm._identity_props = None
+    jm._identity_cache.clear()
     jm._part_values_work = None
+    jm._ownership_field = None
+    jm._ownership_warned = False
     env.reset_world()
 
 
@@ -76,15 +91,165 @@ reset_mod()
 jak, jak_beh = make_weapon("JAK_PS", (0, 1, 2, 3))
 check("JAK_PS recognised", jm.is_jakobs_pistol(jak))
 check(
-    "identity property discovered",
-    jm._identity_props == ["BodyData"],
-    str(jm._identity_props),
+    "identity found in the graph",
+    any("JAK_PS" in text for text in jm.collect_identity(jak)),
+    str(jm.collect_identity(jak))[:160],
 )
 
 jak_sg, _ = make_weapon("JAK_SG", (0, 1, 2, 3))
 check("JAK_SG rejected", not jm.is_jakobs_pistol(jak_sg))
 ted_ps, _ = make_weapon("TED_PS", (0, 1, 2, 3))
 check("TED_PS rejected", not jm.is_jakobs_pistol(ted_ps))
+
+# --------------------------------------------------------------------------- #
+# The first in-game run found no type name on the weapon at all: BL4's weapon
+# definitions are NCS data, not UObjects, so the only readable clue is an asset
+# reference sitting one or more hops away. These cover that shape.
+print("\n== identity is found through the object graph, not one property ==")
+reset_mod()
+
+# Nested: the name is on a sub-object, not on the weapon.
+nested = env.FakeObject("OakWeapon", path="World.Unnamed_1", Tag="nothing useful")
+body = env.FakeObject(
+    "OakWeaponBody",
+    path="World.Unnamed_1.Body",
+    Mesh="/Game/Gear/Weapons/Pistols/JAK/Model/SK_JAK_PS.SK_JAK_PS",
+)
+nested._props["BodyOwner"] = body
+check("identity reachable one hop away", jm.is_jakobs_pistol(nested))
+
+# Two hops, via the directory layout rather than the JAK_PS tag.
+reset_mod()
+deep_leaf = env.FakeObject(
+    "MaterialInstance",
+    path="World.Deep.Mat",
+    Asset="/Game/Gear/Weapons/Pistols/JAK/Materials/DA_MD_JAK.DA_MD_JAK",
+)
+deep_mid = env.FakeObject("MeshComponent", path="World.Deep.Mesh")
+deep_mid._props["Material"] = deep_leaf
+deep = env.FakeObject("OakWeapon", path="World.Deep")
+deep._props["Mesh1P"] = deep_mid
+check("identity reachable two hops away", jm.is_jakobs_pistol(deep))
+
+# Through an array, which is where parts and components live.
+reset_mod()
+arrayed = env.FakeObject("OakWeapon", path="World.Arrayed")
+arrayed._props["Parts"] = [
+    env.FakeObject("Part", path="World.Arrayed.P0", Asset="/Game/Whatever/Thing"),
+    env.FakeObject("Part", path="World.Arrayed.P1", Asset="Body_JAK_PS"),
+]
+check("identity reachable through an array", jm.is_jakobs_pistol(arrayed))
+
+# An explicit tag beats the directory heuristic: a weapon that borrows a shared
+# or licensed asset from the Jakobs pistol folder is still whatever its own tag
+# says it is.
+reset_mod()
+borrower = env.FakeObject(
+    "OakWeapon",
+    path="World.Borrower",
+    BodyData="/Game/Gear/Weapons/Shotguns/JAK/Body_JAK_SG.Body_JAK_SG",
+    Licensed="/Game/Gear/Weapons/Pistols/JAK/Shared/SomeSharedThing",
+)
+check("an explicit tag outranks the directory", not jm.is_jakobs_pistol(borrower))
+
+# ... but with no tag anywhere, the directory is all there is to go on.
+reset_mod()
+untagged = env.FakeObject(
+    "OakWeapon",
+    path="World.Untagged",
+    Mesh="/Game/Gear/Weapons/Pistols/JAK/Model/SK_Revolver.SK_Revolver",
+)
+check("the directory is used when nothing is tagged", jm.is_jakobs_pistol(untagged))
+
+# A reference cycle must terminate.
+reset_mod()
+a = env.FakeObject("OakWeapon", path="World.Cycle.A")
+bb = env.FakeObject("Thing", path="World.Cycle.B")
+a._props["Link"] = bb
+bb._props["Back"] = a
+try:
+    check("a reference cycle terminates", jm.is_jakobs_pistol(a) is False)
+except RecursionError as exc:  # noqa: BLE001
+    check("a reference cycle terminates", False, repr(exc))
+
+# Upward links are not followed - otherwise one weapon would see the whole map.
+reset_mod()
+world_owner = env.FakeObject("World", path="World", Name="Body_JAK_PS")
+owned = env.FakeObject("OakWeapon", path="World.Owned")
+owned._props["Owner"] = world_owner
+check("upward links are not followed", not jm.is_jakobs_pistol(owned))
+
+# Vehicle turrets are weapons too, and were the first things the live scan hit.
+reset_mod()
+turret, _ = make_weapon("JAK_PS", (1, 2, 3, 4))
+turret._class_name = "OakVehicleWeapon"
+check("vehicle weapons are ignored", not jm.is_jakobs_pistol(turret))
+
+# Identity is cached per weapon, and cleared on restore.
+reset_mod()
+w, b = make_weapon("JAK_PS", (1, 2, 3, 4))
+jm.is_jakobs_pistol(w)
+check("identity cached", len(jm._identity_cache) == 1, str(len(jm._identity_cache)))
+jm.restore_all()
+check("restore clears the identity cache", not jm._identity_cache)
+
+# --------------------------------------------------------------------------- #
+# The sweep sees every weapon actor in the level, so enemy guns have to be
+# filtered out or they become 2.4x damage enemies.
+print("\n== only the player's weapons are converted ==")
+
+
+def make_player():
+    pawn = env.FakeObject("OakCharacter", path="World.PlayerPawn")
+    pc = env.FakeObject("OakPlayerController", path="World.PC")
+    pc._props["Pawn"] = pawn
+    env.set_player(pc)
+    return pc, pawn
+
+
+reset_mod()
+jm.masher_frequency.value = 4
+pc, pawn = make_player()
+
+mine, mine_beh = make_weapon("JAK_PS", (1, 2, 3, 4))
+mine._props["WeaponUser"] = pawn
+check("my own weapon is recognised", jm.is_player_weapon(mine) is True)
+
+enemy_pawn = env.FakeObject("OakCharacter", path="World.EnemyPawn")
+theirs, theirs_beh = make_weapon("JAK_PS", (1, 2, 3, 4))
+theirs._props["WeaponUser"] = enemy_pawn
+check("an enemy weapon is rejected", jm.is_player_weapon(theirs) is False)
+
+orphan, orphan_beh = make_weapon("JAK_PS", (1, 2, 3, 4))
+check("no owner link at all is undecidable", jm.is_player_weapon(orphan) is None)
+
+jm.scan_all()
+check("my revolver converted", mine_beh.ProjectilesPerShot == 6)
+check("the enemy's revolver left alone", theirs_beh.ProjectilesPerShot == 1)
+check(
+    "undecidable ownership still converts, and warns once",
+    orphan_beh.ProjectilesPerShot == 6 and jm._ownership_warned,
+)
+
+# Ownership through a held component rather than the pawn directly.
+reset_mod()
+pc, pawn = make_player()
+held = env.FakeObject("WeaponBody", path="World.Held")
+held._props["Owner"] = pawn
+indirect, indirect_beh = make_weapon("JAK_PS", (1, 2, 3, 4))
+indirect._props["BodyOwner"] = held
+check("ownership found through one hop", jm.is_player_weapon(indirect) is True)
+
+# With the option off, everything converts.
+reset_mod()
+pc, pawn = make_player()
+jm.player_weapons_only.value = False
+theirs, theirs_beh = make_weapon("JAK_PS", (1, 2, 3, 4))
+theirs._props["WeaponUser"] = env.FakeObject("OakCharacter", path="World.Enemy2")
+jm.scan_all()
+check("option off converts enemy weapons too", theirs_beh.ProjectilesPerShot == 6)
+jm.player_weapons_only.value = True
+env.set_player(None)
 
 # --------------------------------------------------------------------------- #
 print("\n== part values are read through GetPartValue ==")

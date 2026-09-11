@@ -39,7 +39,7 @@ Mods load at **startup only** — fully exit and relaunch, not just back to menu
 
 ## Settings
 
-All four are live-adjustable from the mods menu.
+All are live-adjustable from the mods menu.
 
 | Setting | Default | Effect |
 |---|---|---|
@@ -47,6 +47,7 @@ All four are live-adjustable from the mods menu.
 | Damage Per Projectile | 0.40 | 6 × 0.40 = **2.4× card damage** on a full hit |
 | Spread Multiplier | 3.0 | wide enough to read as a Masher, tight enough to aim |
 | Masher Frequency (in 4) | 1 | roughly a quarter of Jakobs revolvers |
+| Player Weapons Only | On | do not turn enemy revolvers into Mashers too |
 
 ### Which revolvers become Mashers
 
@@ -59,21 +60,21 @@ part would be. Changing **Masher Frequency** reshuffles which guns qualify.
 
 Press the **Scan Weapons Now** keybind (bind it in the mod menu), or run
 `masher scan`. That sweeps every loaded weapon directly and does not depend on
-any hook firing — so if the automatic triggers turn out not to run in solo
-play, this still applies the variant.
+any hook firing.
 
-Then `masher status` shows which triggers are bound and which have actually
-fired:
+This matters: measured in game, only one of the five automatic triggers
+(`PlayEffects`) fires at all — BL4 resolves the others in native code, where
+the SDK cannot see them. `masher status` shows the table:
 
 ```
 hook activity:
-  ServerStartUsing                   bound=True  fired=14
-  ServerEquipInterruptible           bound=True  fired=0
+  ServerStartUsing                   bound=True  fired=0
+  PlayEffects                        bound=True  fired=12
   ...
 ```
 
-A trigger with `bound=True fired=0` after a firefight is one BL4 resolves
-natively instead of through the script VM. That table is the thing to report.
+If a scan still produces no Mashers, `masher dump` prints what the mod can
+actually see about each weapon — that output is the thing to report.
 
 ## Console commands
 
@@ -115,12 +116,16 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-26 checks against a fake engine (`tests/fake_engine.py`) that models the parts
-of the SDK the mod touches — unreal objects with properties and an `Outer`
-chain, class default objects, `find_all`, weak pointers, and the `mods_base`
-decorators. Covers Jakobs-pistol detection, roll stability and distribution,
-damage not compounding across repeated shots, buffs surviving a rescale, clean
-restore, caching, and graceful degradation when properties are missing.
+66 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+of the SDK the mod touches — unreal objects with properties, structs, arrays
+and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
+`mods_base` decorators.
+
+Covers Jakobs-pistol detection through nested objects, arrays and reference
+cycles; explicit tags outranking the directory heuristic; ownership filtering;
+roll stability and distribution; damage not compounding across repeated shots;
+buffs surviving a rescale; clean restore; caching; hook fire counting; and
+graceful degradation when properties are missing.
 
 These cover the mod's logic. They cannot cover the live object graph — see
 **Caveats**.
@@ -132,11 +137,11 @@ These cover the mod's logic. They cannot cover the live object graph — see
 - **The item card still reads "Jakobs Pistol".** Weapon names come from the
   `inv_name_part` / naming-strategy system keyed on attribute thresholds;
   renaming would mean driving that subsystem separately.
-- **Two things need confirming in game on a first run.** The mod logs which
-  weapon property it used to identify gun types (`identifying weapons via …`);
-  if that line never appears, `masher dump` prints everything it can see. And
-  if `Damage` turns out to be recomputed faster than expected, you would see
-  six full-damage projectiles rather than six fractional ones.
+- **Some things are still unconfirmed in game.** Whether the object-graph walk
+  reaches a weapon's type tag; which property links a weapon to its holder (four
+  are tried, and the mod warns if none match); and whether `Damage` stays where
+  it is written between shots. All of them fail visibly, and `masher dump` is
+  written to answer them in one run. `CLAUDE.md` tracks what is settled.
 - Disabling the mod restores every gun it touched.
 
 ## Licence

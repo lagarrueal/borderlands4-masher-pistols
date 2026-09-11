@@ -14,6 +14,15 @@ from enum import Enum, auto
 from typing import Any
 
 _NEXT_ADDR = [0x1000]
+
+# The local player controller, as mods_base.get_pc() would return it.
+PLAYER: dict[str, object] = {"pc": None}
+
+
+def set_player(pc: object) -> None:
+    PLAYER["pc"] = pc
+
+
 _REGISTRY: dict[str, list["FakeObject"]] = {}
 
 
@@ -78,6 +87,10 @@ class FakeObject:
         raise AttributeError(name)
 
     def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_"):
+            # Test-harness internals, not unreal fields.
+            object.__setattr__(self, name, value)
+            return
         props = object.__getattribute__(self, "_props")
         if name not in props:
             # The engine refuses writes to properties that do not exist.
@@ -133,6 +146,7 @@ def find_all(cls_name: str, exact: bool = True):
 
 def reset_world() -> None:
     _REGISTRY.clear()
+    PLAYER["pc"] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +283,9 @@ def install() -> None:
         REGISTERED["mod"] = kw
         return kw
 
+    def get_pc():
+        return PLAYER["pc"]
+
     mods_base.BoolOption = BoolOption
     mods_base.SliderOption = SliderOption
     mods_base.CoopSupport = CoopSupport
@@ -276,5 +293,6 @@ def install() -> None:
     mods_base.command = command
     mods_base.hook = hook
     mods_base.keybind = keybind
+    mods_base.get_pc = get_pc
     mods_base.REGISTERED = REGISTERED
     sys.modules["mods_base"] = mods_base
