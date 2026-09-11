@@ -149,6 +149,33 @@ That is what keeps repeated shots from compounding the multiplier while still
 letting buffs through. It is the one piece of logic worth not breaking — tests
 cover all three paths.
 
+## Diagnosing a silent mod
+
+Hit once already: **a freshly installed mod starts disabled**, and
+`Mod.enable()` is what binds hooks, keybinds *and* commands. So a disabled mod
+is perfectly silent — no logs, and `masher` is not even a command. Check
+`sdk_mods/settings/jakobs_masher.json` for `"enabled": true`, or grep the log
+for `(Disabled)`:
+
+```bash
+grep -i masher OakGame/Binaries/Win64/Plugins/unrealsdk.log
+```
+
+Log timestamps are **UTC**; local here is UTC+2, so an entry that looks two
+hours stale is current.
+
+Everything the mod does is now self-reporting, because guessing cost a session:
+
+- `on_enable` prints the active settings and which hooks bound
+- every hook counts itself and announces its first call
+- `masher status` prints the bound/fired table
+- `masher scan` and the **Scan Weapons Now** keybind sweep every loaded weapon
+  without any hook, via `scan_all()` → `owning_weapon()`
+
+`bound=True fired=0` after real gameplay means BL4 resolves that path natively
+rather than through the script VM, and unrealsdk's ProcessEvent hook never sees
+it. That is why there are five triggers and a manual sweep rather than one hook.
+
 ## What is not verified
 
 The logic has 26 passing tests against a fake engine. The **live object graph

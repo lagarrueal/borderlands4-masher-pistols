@@ -23,6 +23,20 @@ into `Borderlands 4/sdk_mods/`.
 
 Mods load at **startup only** — fully exit and relaunch, not just back to menu.
 
+> **A freshly installed mod starts disabled.** `mods_base` only auto-enables a
+> mod that was enabled last time, and a first install has no saved settings.
+> Open the console (**F10**), type `mods`, and enable **Jakobs Masher**. The
+> choice persists from then on.
+>
+> While a mod is disabled its hooks, keybinds and console commands are all
+> unbound, so it is completely silent — no logs, and `masher` does nothing.
+> When it enables it announces itself:
+>
+> ```
+> [jakobs_masher] enabled - 6 projectiles at 0.40x damage, 1 in 4 revolvers
+> [jakobs_masher] hooks bound: ServerStartUsing, ServerEquipInterruptible, ...
+> ```
+
 ## Settings
 
 All four are live-adjustable from the mods menu.
@@ -41,13 +55,34 @@ its serial encodes — so a given revolver is a Masher in every session, or in
 none. It is a property of the gun, not a per-shot roll, exactly as a barrel
 part would be. Changing **Masher Frequency** reshuffles which guns qualify.
 
+## If nothing happens
+
+Press the **Scan Weapons Now** keybind (bind it in the mod menu), or run
+`masher scan`. That sweeps every loaded weapon directly and does not depend on
+any hook firing — so if the automatic triggers turn out not to run in solo
+play, this still applies the variant.
+
+Then `masher status` shows which triggers are bound and which have actually
+fired:
+
+```
+hook activity:
+  ServerStartUsing                   bound=True  fired=14
+  ServerEquipInterruptible           bound=True  fired=0
+  ...
+```
+
+A trigger with `bound=True fired=0` after a firefight is one BL4 resolves
+natively instead of through the script VM. That table is the thing to report.
+
 ## Console commands
 
 The console key on this install is **F10**.
 
 ```
 masher dump      # print the live fire behaviours, their properties and owners
-masher status    # what the mod has discovered and modified so far
+masher status    # what the mod found, plus the hook activity table
+masher scan      # apply to every loaded weapon now, ignoring hooks
 masher restore   # undo every change without disabling the mod
 ```
 

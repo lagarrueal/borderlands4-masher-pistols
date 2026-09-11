@@ -195,13 +195,50 @@ def install() -> None:
     def BoolOption(identifier, value, true_text=None, false_text=None, **kw):  # noqa: N802
         return _Option(identifier, value, kw.get("display_name"), kw.get("description", ""))
 
-    REGISTERED: dict[str, Any] = {"hooks": [], "commands": [], "mod": None}
+    REGISTERED: dict[str, Any] = {
+        "hooks": [],
+        "commands": [],
+        "keybinds": [],
+        "mod": None,
+    }
+
+    class FakeHook:
+        """Mirrors mods_base.HookType's surface: hook_funcs + get_active_count."""
+
+        def __init__(self, fn, target, typ):
+            self.__wrapped__ = fn
+            self.hook_identifier = fn.__name__
+            self.hook_funcs = [(target, typ)]
+            self.active = True
+
+        def get_active_count(self) -> int:
+            return len(self.hook_funcs) if self.active else 0
+
+        def __call__(self, *a, **kw):
+            return self.__wrapped__(*a, **kw)
 
     def hook(target: str, typ: Any = None, identifier: str | None = None):
         def deco(fn):
-            fn.hook_target = target
-            REGISTERED["hooks"].append(fn)
-            return fn
+            h = FakeHook(fn, target, typ)
+            REGISTERED["hooks"].append(h)
+            return h
+
+        return deco
+
+    class FakeKeybind:
+        def __init__(self, fn, name, description=""):
+            self.__wrapped__ = fn
+            self.name = name
+            self.description = description
+
+        def __call__(self, *a, **kw):
+            return self.__wrapped__(*a, **kw)
+
+    def keybind(name: str, *a: Any, **kw: Any):
+        def deco(fn):
+            kb = FakeKeybind(fn, name, kw.get("description", ""))
+            REGISTERED["keybinds"].append(kb)
+            return kb
 
         return deco
 
@@ -238,5 +275,6 @@ def install() -> None:
     mods_base.build_mod = build_mod
     mods_base.command = command
     mods_base.hook = hook
+    mods_base.keybind = keybind
     mods_base.REGISTERED = REGISTERED
     sys.modules["mods_base"] = mods_base

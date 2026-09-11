@@ -31,6 +31,7 @@ from mods_base import (
     build_mod,
     command,
     hook,
+    keybind,
 )
 from unrealsdk.hooks import Type
 from unrealsdk.unreal import BoundFunction, UObject, WeakPointer, WrappedStruct
@@ -419,8 +420,65 @@ def fire_behaviours_of(weapon: UObject) -> list[UObject]:
     return found
 
 
-def process_weapon(weapon: UObject) -> None:
-    """Bring one weapon up to date. Cheap on the common path."""
+def owning_weapon(behaviour: UObject) -> UObject | None:
+    """Walk up from a fire behaviour to the weapon it belongs to.
+
+    Behaviour classes are all named `WeaponBehavior_*`, so requiring the name
+    to *end* in Weapon picks the actor without matching a sibling behaviour.
+    """
+    outer = behaviour
+    for _ in range(8):
+        try:
+            outer = outer.Outer
+        except Exception:
+            return None
+        if outer is None:
+            return None
+        try:
+            if outer.Class.Name.endswith("Weapon"):
+                return outer
+        except Exception:
+            return None
+    return None
+
+
+def scan_all() -> int:
+    """Process every live weapon, without relying on any hook firing.
+
+    This is the fallback the keybind and `masher scan` use. It walks from the
+    fire behaviours rather than from a weapon class name, so it does not care
+    what the weapon actor is actually called.
+    """
+    by_weapon: dict[int, tuple[UObject, list[UObject]]] = {}
+
+    for behaviour in unrealsdk.find_all(FIRE_BEHAVIOUR_CLASS, False):
+        try:
+            if behaviour == behaviour.Class.ClassDefaultObject:
+                continue
+        except Exception:
+            continue
+        weapon = owning_weapon(behaviour)
+        if weapon is None:
+            continue
+        entry = by_weapon.setdefault(weapon._get_address(), (weapon, []))
+        entry[1].append(behaviour)
+
+    for weapon, behaviours in by_weapon.values():
+        try:
+            process_weapon(weapon, behaviours)
+        except Exception:
+            log(f"error while processing {weapon._path_name()}:")
+            traceback.print_exc()
+
+    return len(by_weapon)
+
+
+def process_weapon(weapon: UObject, known: list[UObject] | None = None) -> None:
+    """Bring one weapon up to date. Cheap on the common path.
+
+    `known` lets a caller that already enumerated the behaviours skip the
+    object-list scan - `scan_all` groups them once instead of once per weapon.
+    """
     address = weapon._get_address()
     path = weapon._path_name()
     cached = _weapon_cache.get(address)
@@ -439,7 +497,7 @@ def process_weapon(weapon: UObject) -> None:
         _weapon_cache[address] = (path, [], False)
         return
 
-    behaviours = fire_behaviours_of(weapon)
+    behaviours = known if known is not None else fire_behaviours_of(weapon)
     if not behaviours:
         debug(f"no {FIRE_BEHAVIOUR_CLASS} found under {path}")
         return
@@ -460,6 +518,28 @@ def process_weapon(weapon: UObject) -> None:
     )
 
 
+# Which hooks have actually fired, and how often. BL4 may resolve a shot
+# without going through the path we expect, so rather than assume, every hook
+# counts itself and announces its first call. `masher status` prints the table.
+_fires: dict[str, int] = {}
+
+
+def _fired(name: str) -> None:
+    count = _fires.get(name, 0) + 1
+    _fires[name] = count
+    if count == 1:
+        log(f"hook '{name}' fired for the first time")
+
+
+def _guard(name: str, run) -> None:
+    _fired(name)
+    try:
+        run()
+    except Exception:
+        log(f"error in hook '{name}':")
+        traceback.print_exc()
+
+
 @hook("/Script/GbxWeapon.Weapon:ServerStartUsing", Type.PRE)
 def on_start_using(
     obj: UObject,
@@ -467,11 +547,7 @@ def on_start_using(
     ret: Any,
     func: BoundFunction,
 ) -> None:
-    try:
-        process_weapon(obj)
-    except Exception:
-        log("error while processing a weapon:")
-        traceback.print_exc()
+    _guard("ServerStartUsing", lambda: process_weapon(obj))
 
 
 @hook("/Script/GbxWeapon.Weapon:ServerEquipInterruptible", Type.PRE)
@@ -481,11 +557,7 @@ def on_equip(
     ret: Any,
     func: BoundFunction,
 ) -> None:
-    try:
-        process_weapon(obj)
-    except Exception:
-        log("error while processing a weapon:")
-        traceback.print_exc()
+    _guard("ServerEquipInterruptible", lambda: process_weapon(obj))
 
 
 @hook("/Script/GbxWeapon.Weapon:ServerStartReloading", Type.PRE)
@@ -495,11 +567,63 @@ def on_reload(
     ret: Any,
     func: BoundFunction,
 ) -> None:
-    try:
-        process_weapon(obj)
-    except Exception:
-        log("error while processing a weapon:")
-        traceback.print_exc()
+    _guard("ServerStartReloading", lambda: process_weapon(obj))
+
+
+@hook("/Script/GbxWeapon.Weapon:PlayEffects", Type.PRE)
+def on_play_effects(
+    obj: UObject,
+    args: WrappedStruct,
+    ret: Any,
+    func: BoundFunction,
+) -> None:
+    _guard("PlayEffects", lambda: process_weapon(obj))
+
+
+@hook("/Script/OakGame.OakCharacter:ClientSetActiveWeaponEquipSlot", Type.POST)
+def on_weapon_swap(
+    obj: UObject,
+    args: WrappedStruct,
+    ret: Any,
+    func: BoundFunction,
+) -> None:
+    # This one is on the character, not the weapon, so it cannot name a weapon
+    # directly - sweep instead.
+    _guard("ClientSetActiveWeaponEquipSlot", scan_all)
+
+
+HOOKS = (
+    on_start_using,
+    on_equip,
+    on_reload,
+    on_play_effects,
+    on_weapon_swap,
+)
+
+
+def on_mod_enabled() -> None:
+    """Report what actually bound, so a silent mod is diagnosable."""
+    bound = []
+    unbound = []
+    for hook_obj in HOOKS:
+        for func_name, _hook_type in hook_obj.hook_funcs:
+            short = func_name.rsplit(":", 1)[-1]
+            (bound if hook_obj.get_active_count() else unbound).append(short)
+
+    log(f"enabled - {int(projectiles.value)} projectiles at "
+        f"{float(damage_scale.value):.2f}x damage, "
+        f"{int(masher_frequency.value)} in 4 revolvers")
+    log(f"hooks bound: {', '.join(bound) if bound else 'NONE'}")
+    if unbound:
+        log(f"hooks NOT bound: {', '.join(unbound)}")
+    log("press the 'Scan Weapons Now' keybind or run 'masher scan' if nothing happens")
+
+
+@keybind("Scan Weapons Now", description="Apply the Masher variant to every loaded weapon now.")
+def scan_keybind() -> None:
+    """Hook-independent trigger, for when the automatic ones do not fire."""
+    found = scan_all()
+    log(f"scanned {found} weapon(s)")
 
 
 # --------------------------------------------------------------------------- #
@@ -512,9 +636,22 @@ def masher_command(args: Any) -> None:
     if args.action == "status":
         log(f"identity properties: {_identity_props}")
         log(f"GetPartValue usable: {_part_values_work}")
+        log("hook activity:")
+        for hook_obj in HOOKS:
+            for func_name, _hook_type in hook_obj.hook_funcs:
+                short = func_name.rsplit(":", 1)[-1]
+                log(
+                    f"  {short:<34} bound={bool(hook_obj.get_active_count())}"
+                    f"  fired={_fires.get(short, 0)}"
+                )
         log(f"weapons seen: {len(_weapon_cache)}, behaviours modified: {len(_touched)}")
         for path, pointers, is_masher in _weapon_cache.values():
             log(f"  masher={is_masher}  behaviours={len(pointers)}  {path}")
+        return
+
+    if args.action == "scan":
+        found = scan_all()
+        log(f"scanned {found} weapon(s)")
         return
 
     if args.action == "restore":
@@ -562,8 +699,11 @@ masher_command.add_argument(
     "action",
     nargs="?",
     default="dump",
-    choices=("dump", "status", "restore"),
-    help="dump the live weapon data, show mod status, or undo all changes",
+    choices=("dump", "status", "scan", "restore"),
+    help=(
+        "dump the live weapon data, show mod status and hook activity,"
+        " scan every loaded weapon now, or undo all changes"
+    ),
 )
 
 
@@ -571,5 +711,6 @@ masher_command.add_argument(
 
 build_mod(
     coop_support=CoopSupport.HostOnly,
+    on_enable=on_mod_enabled,
     on_disable=restore_all,
 )

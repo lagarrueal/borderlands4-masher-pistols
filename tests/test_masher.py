@@ -240,22 +240,94 @@ except Exception as exc:  # noqa: BLE001
     check("no Damage/Spread property does not crash", False, repr(exc))
 
 # --------------------------------------------------------------------------- #
-print("\n== hooks and commands registered ==")
-targets = [h.hook_target for h in env.sys.modules["mods_base"].REGISTERED["hooks"]]
+print("\n== hook-independent scan ==")
+reset_mod()
+jm.masher_frequency.value = 4
+w1, b1 = make_weapon("JAK_PS", (1, 2, 3, 4))
+w2, b2 = make_weapon("JAK_PS", (5, 6, 7, 8))
+sg, sgb = make_weapon("JAK_SG", (1, 2, 3, 4))
+
+check("owning_weapon walks up to the actor", jm.owning_weapon(b1) is w1)
+
+found = jm.scan_all()
+check("scan visits every weapon", found == 3, f"{found} weapons")
+check("both revolvers converted", b1.ProjectilesPerShot == 6 and b2.ProjectilesPerShot == 6)
+check("shotgun still untouched", sgb.ProjectilesPerShot == 1)
+
+# scan_all groups behaviours once, so process_weapon must not rescan per weapon.
+calls = {"n": 0}
+real_find_all = jm.unrealsdk.find_all
+
+
+def counting(*a, **kw):
+    calls["n"] += 1
+    return real_find_all(*a, **kw)
+
+
+reset_mod()
+jm.unrealsdk.find_all = counting
+jm.scan_all()
+jm.unrealsdk.find_all = real_find_all
+check("scan_all enumerates the object list once", calls["n"] == 1, f"{calls['n']} scans")
+
+# --------------------------------------------------------------------------- #
+print("\n== hooks, keybind and commands registered ==")
+hooks = env.sys.modules["mods_base"].REGISTERED["hooks"]
+targets = [h.hook_funcs[0][0] for h in hooks]
 check(
-    "three weapon hooks",
+    "five triggers registered",
     targets
     == [
         "/Script/GbxWeapon.Weapon:ServerStartUsing",
         "/Script/GbxWeapon.Weapon:ServerEquipInterruptible",
         "/Script/GbxWeapon.Weapon:ServerStartReloading",
+        "/Script/GbxWeapon.Weapon:PlayEffects",
+        "/Script/OakGame.OakCharacter:ClientSetActiveWeaponEquipSlot",
     ],
     str(targets),
 )
+check("HOOKS tuple matches what was registered", list(jm.HOOKS) == hooks)
+
+# Firing a hook must count itself and announce the first call.
+reset_mod()
+jm._fires.clear()
+jm.masher_frequency.value = 4
+w, b = make_weapon("JAK_PS", (1, 2, 3, 4))
+jm.on_start_using(w, None, None, None)
+jm.on_start_using(w, None, None, None)
+check("hook fires are counted", jm._fires.get("ServerStartUsing") == 2, str(jm._fires))
+check("the hook did its job", b.ProjectilesPerShot == 6)
+
+# A hook that raises must not propagate into the engine.
+jm._fires.clear()
+broken = env.FakeObject("OakWeapon", path="World.Broken")  # no properties at all
+try:
+    jm.on_start_using(broken, None, None, None)
+    check("a failing hook is swallowed", True)
+except Exception as exc:  # noqa: BLE001
+    check("a failing hook is swallowed", False, repr(exc))
+
+kbs = env.sys.modules["mods_base"].REGISTERED["keybinds"]
+check("scan keybind registered", len(kbs) == 1 and kbs[0].name == "Scan Weapons Now")
+
 cmds = env.sys.modules["mods_base"].REGISTERED["commands"]
 check("masher command registered", len(cmds) == 1 and cmds[0].cmd == "masher")
+for action in ("dump", "status", "scan", "restore"):
+    try:
+        cmds[0](action)
+        check(f"'masher {action}' runs", True)
+    except Exception as exc:  # noqa: BLE001
+        check(f"'masher {action}' runs", False, repr(exc))
+
 mod_kwargs = env.sys.modules["mods_base"].REGISTERED["mod"]
 check("restore wired to disable", mod_kwargs.get("on_disable") is jm.restore_all)
+check("report wired to enable", mod_kwargs.get("on_enable") is jm.on_mod_enabled)
+
+try:
+    jm.on_mod_enabled()
+    check("enable report runs", True)
+except Exception as exc:  # noqa: BLE001
+    check("enable report runs", False, repr(exc))
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILURE(S): {FAILS}"))
 sys.exit(1 if FAILS else 0)
