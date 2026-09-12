@@ -51,8 +51,23 @@ All are live-adjustable from the mods menu.
 
 ### Telling which gun is a Masher
 
-There is no visual cue yet — see **Caveats**. `masher mine` lists what you are
-carrying, with each gun's manufacturer/class tag and its live projectile count:
+**The item card tells you.** Every weapon class declares two damage rows and
+picks between them on the `weapon_projectile_per_shot` attribute:
+
+| Row | Condition | Renders |
+|---|---|---|
+| `uistat_damage` | `weapon_projectile_per_shot` ≤ 1 | `Damage: 847` |
+| `uistat_damage_and_projectile_count` | `weapon_projectile_per_shot` > 1 | `Damage: 847 x 6` |
+
+That attribute resolves from `WeaponBehavior_FireProjectile.ProjectilesPerShot`
+— exactly what this mod writes — so a working Masher shows **`x 6`** on its card
+with no UI work, the same way a shotgun shows its pellet count. `weapon_ps`
+carries the row already; nothing had to be added.
+
+That also makes the card the verification: no `x 6`, no Masher.
+
+`masher mine` gives the same answer from the console, for all carried guns at
+once:
 
 ```
 2 weapon(s) you are carrying:
@@ -147,12 +162,10 @@ These cover the mod's logic. They cannot cover the live object graph — see
 
 - **Host only.** The change is applied where the shot is resolved, so in co-op
   it affects the host's own guns.
-- **The item card still reads "Jakobs Pistol", and will not show "x6".** Weapon
-  names come from the `inv_name_part` / naming-strategy system keyed on
-  attribute thresholds; renaming means driving that subsystem separately. As for
-  the damage number: the card shows *per projectile* damage, so a working Masher
-  makes it go **down**, not up — BL3 showed `damage x6` because its card had a
-  projectile row, and no stock BL4 pistol has one. Use `masher mine` meanwhile.
+- **The item card still reads "Jakobs Pistol"** — weapon names come from the
+  `inv_name_part` / naming-strategy system keyed on attribute thresholds, and
+  renaming means driving that subsystem separately. The **damage row does**
+  change, though: see below.
 - **Per-projectile damage may not be adjustable.** `WeaponBehavior_FireProjectile`
   appears to reflect only `ProjectilesPerShot`; `Damage` and `Spread` are
   configured on the definition and resolved through the attribute system. If the

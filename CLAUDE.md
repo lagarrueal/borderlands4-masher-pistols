@@ -202,6 +202,33 @@ why one line of log took a whole session to explain.
 `behaviours modified: 2` was reported while nothing had been modified. It now
 records only successful writes.
 
+### The item card follows for free
+
+`Nexus-Data-ui_stat0.ncs` defines two damage rows whose `displaycondition` is a
+straight comparison on the attribute `weapon_projectile_per_shot`:
+
+| Row | Condition | `statvalue` |
+|---|---|---|
+| `uistat_damage` | `LessOrEqual 1.0` | `$VALUE$` of `weapon_damage` |
+| `uistat_damage_and_projectile_count` | `GreaterThan 1.0` | `{dmg} x {proj}` |
+
+And **every** weapon base type in `inv0` lists both — `weapon_ar`, `weapon_ps`,
+`weapon_sg`, `weapon_sm`, `weapon_sr`:
+
+```
+weapon_ps  uistats: [uistat_damage, uistat_damage_and_projectile_count, uistat_typeline_ps]
+```
+
+So the pistol card already knows how to render `{dmg} x {proj}`; it simply never
+fires because no stock pistol exceeds one projectile. Since
+`weapon_projectile_per_shot` resolves *from* the very property this mod writes,
+the card flips by itself. **No UI work is needed, and the card is the
+verification signal.**
+
+(I had claimed the opposite — that no pistol had a projectile row, so the card
+could never show it. Wrong on both counts, and checkable in the data the whole
+time.)
+
 ### Enemies hold weapons too
 
 `scan_all()` sees every weapon actor in the level. Converting them all makes
@@ -278,9 +305,7 @@ sessions now:
   a Masher is 6x total damage rather than 2.4x. The honest fallbacks are
   lowering the projectile count, or driving `weapon_damage` through the
   attribute system — which means finding the attribute-modifier API.
-- **Whether the item card reflects any of it.** The card reads the attribute
-  `weapon_projectile_per_shot`, which resolves *from* `ProjectilesPerShot`, so
-  it may follow automatically — or the pistol card may simply have no
-  projectile-count row, since no stock pistol has one.
+- ~~Whether the item card reflects any of it.~~ **Settled — it does.** See
+  below.
 - `PlayEffects` has only been observed firing for `OakVehicleWeapon` turrets, so
   it is still not confirmed to fire for player guns. The keybind covers this.
