@@ -183,9 +183,25 @@ through the script VM, so unrealsdk's ProcessEvent hook never sees it. Do not
 assume a reflection-resolved function name implies a reachable hook — the name
 being real is necessary, not sufficient.
 
-This is why `scan_all()` exists: a hook-independent sweep, reachable from the
-**Scan Weapons Now** keybind and `masher scan`, that walks every live fire
-behaviour up to its weapon via `owning_weapon()`.
+This is why `scan_all()` exists: a hook-independent sweep that walks every live
+fire behaviour up to its weapon via `owning_weapon()`.
+
+**Automatic application therefore rides on events that are reachable**, picked
+by copying what working mods already hook rather than by guessing again:
+
+| Trigger | Why it was chosen | Throttle |
+|---|---|---|
+| `OakUIDataCollector_Weapon:OnWeaponEquipped` | the equip event the UI itself uses | immediate |
+| `OakPlayerController:ServerUseObject` | interacting, i.e. picking a gun up | immediate |
+| `OakPlayerController:ServerUseJunkObject` | trashSeller hooks exactly this, so it is proven reachable | immediate |
+| `OakPlayerController:OnEquipSlotsReadyForInventory` | inventory ready after a load | immediate |
+| `GbxAudio.GbxAudioBlueprintFunctionLibrary:PostEventInWorld` | music_watch hooks this library; fires constantly, so it is the heartbeat | `Scan Interval`, default 3s |
+
+`maybe_scan()` holds the throttle: `force` for the keybind and console (always
+works, even with automatic scanning off), `immediate` for equip-like events
+(floored at 0.25s so an equip burst collapses to one sweep), and the interval
+for the heartbeat. A sweep that raises is contained rather than escaping into
+the engine.
 
 ### Identity is not a property — it is a graph walk
 

@@ -20,6 +20,7 @@ revolver is a Masher in every session or in none.
 from __future__ import annotations
 
 import re
+import time
 import traceback
 from typing import Any
 
@@ -144,6 +145,31 @@ player_weapons_only = BoolOption(
         " in the level, enemies included, and a Masher in enemy hands is a"
         " 2.4x damage enemy. Turn off to convert every Jakobs revolver in the"
         " world."
+    ),
+)
+
+auto_scan = BoolOption(
+    "Automatic Scanning",
+    True,
+    "On",
+    "Off",
+    display_name="Automatic Scanning",
+    description=(
+        "Convert new guns by itself, instead of needing the keybind. None of"
+        " the weapon-side hooks fire in solo play, so this rides on events"
+        " that do - equipping, interacting, and a throttled heartbeat."
+    ),
+)
+
+scan_interval = SliderOption(
+    "Scan Interval",
+    3,
+    1,
+    30,
+    display_name="Scan Interval (seconds)",
+    description=(
+        "How often the heartbeat may re-scan. Equipping or interacting scans"
+        " immediately regardless. Raise it if you ever see a hitch."
     ),
 )
 
@@ -1066,6 +1092,52 @@ def _guard(name: str, run) -> None:
         traceback.print_exc()
 
 
+# When the last automatic sweep ran, so a high-frequency trigger cannot turn
+# into a per-frame object scan.
+_last_scan = 0.0
+
+# Even an "immediate" trigger is not allowed to sweep more often than this;
+# equipping can fire several events in a burst.
+IMMEDIATE_FLOOR_SECONDS = 0.25
+
+
+def maybe_scan(reason: str, immediate: bool = False, force: bool = False) -> int:
+    """Sweep, unless one ran too recently. Returns weapons processed."""
+    global _last_scan
+
+    if not force and not auto_scan.value:
+        return 0
+
+    now = time.monotonic()
+    if not force:
+        interval = IMMEDIATE_FLOOR_SECONDS if immediate else float(scan_interval.value)
+        if now - _last_scan < interval:
+            return 0
+    _last_scan = now
+
+    try:
+        return scan_all()
+    except Exception:
+        log(f"error during automatic scan from {reason}:")
+        traceback.print_exc()
+        return 0
+
+
+# --------------------------------------------------------------------------- #
+# Triggers.
+#
+# The five weapon-side hooks below have NEVER been observed firing in solo play
+# - BL4 resolves those paths natively, where unrealsdk's ProcessEvent hook
+# cannot see them. They are kept because they cost nothing and their counters
+# are evidence, but nothing may depend on them.
+#
+# The triggers that follow are ones other working mods prove are reachable:
+# trashSeller hooks OakPlayerController:ServerUseJunkObject, and music_watch
+# hooks the Gbx audio library. Each one only asks for a sweep; the throttle
+# decides whether it happens.
+# --------------------------------------------------------------------------- #
+
+
 @hook("/Script/GbxWeapon.Weapon:ServerStartUsing", Type.PRE)
 def on_start_using(
     obj: UObject,
@@ -1113,9 +1185,62 @@ def on_weapon_swap(
     ret: Any,
     func: BoundFunction,
 ) -> None:
-    # This one is on the character, not the weapon, so it cannot name a weapon
-    # directly - sweep instead.
-    _guard("ClientSetActiveWeaponEquipSlot", scan_all)
+    _guard("ClientSetActiveWeaponEquipSlot", lambda: maybe_scan("weapon swap", True))
+
+
+@hook("/Script/OakGame.OakUIDataCollector_Weapon:OnWeaponEquipped", Type.POST)
+def on_ui_weapon_equipped(
+    obj: UObject,
+    args: WrappedStruct,
+    ret: Any,
+    func: BoundFunction,
+) -> None:
+    _guard("OnWeaponEquipped", lambda: maybe_scan("weapon equipped", True))
+
+
+@hook("/Script/OakGame.OakPlayerController:ServerUseObject", Type.POST)
+def on_use_object(
+    obj: UObject,
+    args: WrappedStruct,
+    ret: Any,
+    func: BoundFunction,
+) -> None:
+    # Interacting with the world - which is how a dropped gun gets picked up.
+    _guard("ServerUseObject", lambda: maybe_scan("used an object", True))
+
+
+@hook("/Script/OakGame.OakPlayerController:ServerUseJunkObject", Type.POST)
+def on_use_junk(
+    obj: UObject,
+    args: WrappedStruct,
+    ret: Any,
+    func: BoundFunction,
+) -> None:
+    # Proven reachable: trashSeller hooks exactly this.
+    _guard("ServerUseJunkObject", lambda: maybe_scan("used a junk object", True))
+
+
+@hook("/Script/OakGame.OakPlayerController:OnEquipSlotsReadyForInventory", Type.POST)
+def on_slots_ready(
+    obj: UObject,
+    args: WrappedStruct,
+    ret: Any,
+    func: BoundFunction,
+) -> None:
+    _guard("OnEquipSlotsReadyForInventory", lambda: maybe_scan("equip slots ready", True))
+
+
+@hook("/Script/GbxAudio.GbxAudioBlueprintFunctionLibrary:PostEventInWorld", Type.POST)
+def on_audio_event(
+    obj: UObject,
+    args: WrappedStruct,
+    ret: Any,
+    func: BoundFunction,
+) -> None:
+    # The heartbeat. Fires constantly - footsteps, gunfire, UI - so it is
+    # throttled to `Scan Interval` and does nothing most of the time. Proven
+    # reachable: music_watch hooks this library.
+    _guard("PostEventInWorld", lambda: maybe_scan("audio heartbeat"))
 
 
 HOOKS = (
@@ -1124,6 +1249,11 @@ HOOKS = (
     on_reload,
     on_play_effects,
     on_weapon_swap,
+    on_ui_weapon_equipped,
+    on_use_object,
+    on_use_junk,
+    on_slots_ready,
+    on_audio_event,
 )
 
 
@@ -1142,13 +1272,20 @@ def on_mod_enabled() -> None:
     log(f"hooks bound: {', '.join(bound) if bound else 'NONE'}")
     if unbound:
         log(f"hooks NOT bound: {', '.join(unbound)}")
-    log("press the 'Scan Weapons Now' keybind or run 'masher scan' if nothing happens")
+    if auto_scan.value:
+        log(
+            f"automatic scanning on, heartbeat every {int(scan_interval.value)}s"
+            " - equipping and interacting scan immediately"
+        )
+    else:
+        log("automatic scanning off - use the 'Scan Weapons Now' keybind")
+    log("'masher mine' shows what your guns are actually doing")
 
 
 @keybind("Scan Weapons Now", description="Apply the Masher variant to every loaded weapon now.")
 def scan_keybind() -> None:
     """Hook-independent trigger, for when the automatic ones do not fire."""
-    found = scan_all()
+    found = maybe_scan("keybind", force=True)
     log(f"scanned {found} weapon(s)")
 
 
@@ -1188,7 +1325,7 @@ def masher_command(args: Any) -> None:
         return
 
     if args.action == "scan":
-        found = scan_all()
+        found = maybe_scan("console", force=True)
         log(f"scanned {found} weapon(s)")
         return
 

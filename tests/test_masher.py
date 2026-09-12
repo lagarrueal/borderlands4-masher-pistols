@@ -802,18 +802,117 @@ jm.unrealsdk.find_all = real_find_all
 check("scan_all enumerates the object list once", calls["n"] == 1, f"{calls['n']} scans")
 
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# The heartbeat trigger fires constantly (every sound in the game), so the
+# throttle is what keeps it from becoming a per-frame object scan.
+print("\n== automatic scanning is throttled ==")
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+clock = FakeClock()
+real_time = jm.time
+jm.time = clock
+
+reset_mod()
+jm.masher_frequency.value = 4
+jm._last_scan = 0.0
+jm.auto_scan.value = True
+jm.scan_interval.value = 3
+
+scans = {"n": 0}
+real_scan_all = jm.scan_all
+
+
+def counting_scan():
+    scans["n"] += 1
+    return real_scan_all()
+
+
+jm.scan_all = counting_scan
+
+jm.maybe_scan("first")
+check("the first heartbeat scans", scans["n"] == 1, str(scans["n"]))
+
+jm.maybe_scan("too soon")
+jm.maybe_scan("still too soon")
+check("further heartbeats inside the interval do not", scans["n"] == 1, str(scans["n"]))
+
+clock.advance(3.5)
+jm.maybe_scan("after the interval")
+check("a heartbeat after the interval scans", scans["n"] == 2, str(scans["n"]))
+
+# Equipping should not wait for the heartbeat.
+clock.advance(0.5)
+jm.maybe_scan("equipped", immediate=True)
+check("an immediate trigger scans straight away", scans["n"] == 3, str(scans["n"]))
+
+# ... but a burst of equip events still collapses to one sweep.
+jm.maybe_scan("equipped", immediate=True)
+jm.maybe_scan("equipped", immediate=True)
+check("a burst of immediate triggers collapses", scans["n"] == 3, str(scans["n"]))
+
+# The keybind and console must always work, throttle or not.
+jm.maybe_scan("keybind", force=True)
+check("force bypasses the throttle", scans["n"] == 4, str(scans["n"]))
+
+# And the option must actually disable it.
+jm.auto_scan.value = False
+clock.advance(100)
+jm.maybe_scan("heartbeat while disabled")
+check("automatic scanning can be turned off", scans["n"] == 4, str(scans["n"]))
+jm.maybe_scan("keybind while disabled", force=True)
+check("the keybind still works when it is off", scans["n"] == 5, str(scans["n"]))
+
+# A sweep that raises must not escape into the engine.
+jm.auto_scan.value = True
+clock.advance(100)
+
+
+def exploding_scan():
+    raise RuntimeError("boom")
+
+
+jm.scan_all = exploding_scan
+try:
+    jm.maybe_scan("broken")
+    check("a failing sweep is contained", True)
+except Exception as exc:  # noqa: BLE001
+    check("a failing sweep is contained", False, repr(exc))
+
+jm.scan_all = real_scan_all
+jm.time = real_time
+jm._last_scan = 0.0
+
+# --------------------------------------------------------------------------- #
 print("\n== hooks, keybind and commands registered ==")
 hooks = env.sys.modules["mods_base"].REGISTERED["hooks"]
 targets = [h.hook_funcs[0][0] for h in hooks]
 check(
-    "five triggers registered",
+    "every trigger registered",
     targets
     == [
+        # Weapon-side: never observed firing in solo play, kept as evidence.
         "/Script/GbxWeapon.Weapon:ServerStartUsing",
         "/Script/GbxWeapon.Weapon:ServerEquipInterruptible",
         "/Script/GbxWeapon.Weapon:ServerStartReloading",
         "/Script/GbxWeapon.Weapon:PlayEffects",
         "/Script/OakGame.OakCharacter:ClientSetActiveWeaponEquipSlot",
+        # Reachable ones, which is what automatic scanning actually rides on.
+        "/Script/OakGame.OakUIDataCollector_Weapon:OnWeaponEquipped",
+        "/Script/OakGame.OakPlayerController:ServerUseObject",
+        "/Script/OakGame.OakPlayerController:ServerUseJunkObject",
+        "/Script/OakGame.OakPlayerController:OnEquipSlotsReadyForInventory",
+        "/Script/GbxAudio.GbxAudioBlueprintFunctionLibrary:PostEventInWorld",
     ],
     str(targets),
 )

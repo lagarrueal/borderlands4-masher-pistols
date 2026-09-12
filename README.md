@@ -48,6 +48,8 @@ All are live-adjustable from the mods menu.
 | Spread Multiplier | 3.0 | wide enough to read as a Masher, tight enough to aim |
 | Masher Frequency (in 4) | 1 | roughly a quarter of Jakobs revolvers |
 | Player Weapons Only | On | do not turn enemy revolvers into Mashers too |
+| Automatic Scanning | On | convert new guns without pressing anything |
+| Scan Interval | 3s | how often the background heartbeat may re-scan |
 
 ### Telling which gun is a Masher
 
@@ -86,25 +88,31 @@ its serial encodes — so a given revolver is a Masher in every session, or in
 none. It is a property of the gun, not a per-shot roll, exactly as a barrel
 part would be. Changing **Masher Frequency** reshuffles which guns qualify.
 
-## If nothing happens
+## How it applies itself
 
-Press the **Scan Weapons Now** keybind (bind it in the mod menu), or run
-`masher scan`. That sweeps every loaded weapon directly and does not depend on
-any hook firing.
+Equipping a weapon or interacting with the world scans immediately; a
+throttled heartbeat catches anything else. You should not need to press
+anything.
 
-This matters: measured in game, only one of the five automatic triggers
-(`PlayEffects`) fires at all — BL4 resolves the others in native code, where
-the SDK cannot see them. `masher status` shows the table:
+This is deliberately not built on the weapon's own events. Measured in game,
+**none** of `ServerStartUsing`, `ServerEquipInterruptible`,
+`ServerStartReloading`, `PlayEffects` or `ClientSetActiveWeaponEquipSlot` ever
+fire in solo play — BL4 resolves those natively, where the SDK cannot see them.
+They are still registered, and `masher status` shows the tally, but nothing
+depends on them:
 
 ```
 hook activity:
   ServerStartUsing                   bound=True  fired=0
-  PlayEffects                        bound=True  fired=12
+  OnWeaponEquipped                   bound=True  fired=4
+  PostEventInWorld                   bound=True  fired=2130
   ...
 ```
 
-If a scan still produces no Mashers, `masher dump` prints what the mod can
-actually see about each weapon — that output is the thing to report.
+If something is ever missed, the **Scan Weapons Now** keybind and `masher scan`
+force a sweep regardless of throttle or settings. If a sweep produces no
+Mashers, `masher dump` prints what the mod can see about each weapon — that
+output is the thing to report.
 
 ## Console commands
 
@@ -148,7 +156,7 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-106 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+115 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.
