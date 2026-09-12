@@ -651,15 +651,30 @@ def _read_member(obj, field, subfield):
         return None
 
 
+def _match_type(current, wanted):
+    """Coerce `wanted` to the numeric type the member already holds.
+
+    `ProjectilesPerShot` is a GbxAttributeInteger - writing a float to it fails
+    with "Unable to cast ... to C++ type 'int'", while Damage and Spread are
+    floats. That difference is why spread worked and the projectile count did
+    not, so the existing value decides the type rather than a guess.
+    """
+    if isinstance(current, bool):
+        return bool(wanted)
+    if isinstance(current, int):
+        return int(round(wanted))
+    return float(wanted)
+
+
 def _apply_numbers(obj, field, subfields, values):
     """Write one number to a plain property, or per-member values to a struct."""
     try:
         if not subfields:
-            setattr(obj, field, values[None])
+            setattr(obj, field, _match_type(getattr(obj, field), values[None]))
             return True
         struct = getattr(obj, field)
         for name in subfields:
-            setattr(struct, name, values[name])
+            setattr(struct, name, _match_type(getattr(struct, name), values[name]))
         # A struct read from a property may be a copy, so assign it back.
         setattr(obj, field, struct)
         return True
@@ -722,13 +737,13 @@ def _scale_field(behaviour, knob, scale):
         if current is None:
             return None
         previous = state.get(_state_key(field, name))
-        if previous is not None and abs(current - previous["applied"]) < 1e-4:
-            # Still ours, and the scale may have changed in the menu.
-            base = previous["original"]
-        else:
-            # First touch, or the game recalculated it - rebase so buffs pass
-            # through.
-            base = current
+        # Anchor to the value seen the very first time, and always write
+        # anchor * scale. Re-basing on whatever is there now looks like it
+        # respects buffs, but the engine recomputes Damage from BaseValue, so
+        # each pass would scale its own output and the number would shrink
+        # every scan. Buffs still apply - the engine layers them on top of the
+        # base we set.
+        base = previous["original"] if previous is not None else current
         bases[name] = base
         targets[name] = base * scale
 

@@ -576,6 +576,74 @@ check(
     str(jm.check_drift(stubborn)),
 )
 
+# ProjectilesPerShot is a GbxAttributeInteger: writing a float to it fails with
+# "Unable to cast ... to C++ type 'int'". Damage and Spread are floats, which is
+# why spread worked in game while the projectile count silently did not.
+reset_mod()
+jm.masher_frequency.value = 4
+int_w = env.FakeObject("OakWeapon", path="World.Ints", BodyData="Body_JAK_PS")
+
+
+class TypedStruct(env.WrappedStruct):
+    """Rejects a float written to a member that currently holds an int."""
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        fields = object.__getattribute__(self, "_fields")
+        if name not in fields:
+            raise AttributeError(f"no such struct field {name}")
+        if isinstance(fields[name], int) and not isinstance(value, int):
+            raise TypeError(
+                "Unable to cast Python instance of type "
+                f"{type(value)} to C++ type 'int'"
+            )
+        fields[name] = value
+
+
+int_b = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Ints.Fire",
+    outer=int_w,
+    ProjectilesPerShot=TypedStruct(Value=1, BaseValue=1),
+    Damage=env.WrappedStruct(Value=100.0, BaseValue=100.0),
+)
+applied = jm.make_masher(int_b)
+check(
+    "an integer member is written as an int",
+    int_b.ProjectilesPerShot.Value == 6 and int_b.ProjectilesPerShot.BaseValue == 6,
+    f"Value={int_b.ProjectilesPerShot.Value} BaseValue={int_b.ProjectilesPerShot.BaseValue}",
+)
+check(
+    "the integer write is reported as applied",
+    any("ProjectilesPerShot" in a for a in applied),
+    str(applied),
+)
+check(
+    "float members are still written as floats",
+    abs(int_b.Damage.Value - 40.0) < 1e-6,
+    str(int_b.Damage.Value),
+)
+check("no drift on mixed types", jm.check_drift(int_b) == [], str(jm.check_drift(int_b)))
+
+# Scaling an integer member rounds rather than failing.
+reset_mod()
+jm.masher_frequency.value = 4
+round_w = env.FakeObject("OakWeapon", path="World.Round", BodyData="Body_JAK_PS")
+round_b = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Round.Fire",
+    outer=round_w,
+    Spread=TypedStruct(Value=3, BaseValue=3),
+)
+jm.make_masher(round_b)
+check(
+    "scaling an int member rounds to an int",
+    round_b.Spread.Value == 9 and isinstance(round_b.Spread.Value, int),
+    f"{round_b.Spread.Value!r}",
+)
+
 # End to end through the sweep, with the realistic shape.
 reset_mod()
 jm.masher_frequency.value = 4
@@ -604,20 +672,33 @@ for _ in range(10):
 check("damage does not compound", abs(b.Damage - 40.0) < 1e-6, str(b.Damage))
 check("spread does not compound", abs(b.Spread - 3.0) < 1e-6, str(b.Spread))
 
-# The game recalculating damage (a buff) must survive.
+# Scaling anchors to the value first seen and always writes anchor * scale.
+# Re-basing on whatever is there now looks friendlier, but the engine
+# recomputes Damage from BaseValue, so each pass would scale its own output and
+# the number would shrink every scan.
 b.Damage = 200.0  # engine recalculated, e.g. a skill kicked in
 jm.process_weapon(w)
-check("buffed damage is rescaled, not clobbered", abs(b.Damage - 80.0) < 1e-6, str(b.Damage))
+check(
+    "an engine recompute does not drag the value along",
+    abs(b.Damage - 40.0) < 1e-6,
+    str(b.Damage),
+)
 
-# Changing the option takes effect without compounding.
+# Repeated passes after an engine recompute stay put rather than shrinking.
+for _ in range(5):
+    b.Damage = 200.0
+    jm.process_weapon(w)
+check("no downward drift across passes", abs(b.Damage - 40.0) < 1e-6, str(b.Damage))
+
+# Changing the option rescales from the anchor, not from the last result.
 jm.damage_scale.value = 0.5
 jm.process_weapon(w)
-check("option change re-bases", abs(b.Damage - 100.0) < 1e-6, str(b.Damage))
+check("option change rescales from the anchor", abs(b.Damage - 50.0) < 1e-6, str(b.Damage))
 jm.damage_scale.value = 0.40
 
 jm.restore_all()
 check("projectiles restored", b.ProjectilesPerShot == 1, str(b.ProjectilesPerShot))
-check("damage restored to the live base", abs(b.Damage - 200.0) < 1e-6, str(b.Damage))
+check("damage restored to the anchor", abs(b.Damage - 100.0) < 1e-6, str(b.Damage))
 check("spread restored", abs(b.Spread - 1.0) < 1e-6, str(b.Spread))
 check("bookkeeping cleared", not jm._touched and not jm._weapon_cache)
 

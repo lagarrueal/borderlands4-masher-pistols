@@ -263,8 +263,37 @@ exists — `Damage` runs `BaseValue 82 / Value 241`, a roughly 2.9x modifier
 chain (manufacturer scaling, level, skills), and flattening the two to one
 number would destroy it.
 
-The general lesson, now paid for three times over: **a property is not a
-number, and a number is not the number.** Probe the live object before writing.
+### ...and the members are not all the same type
+
+`ProjectilesPerShot` is a **`GbxAttributeInteger`**; `Damage` and `Spread` are
+floats. Writing a float to the int member fails outright:
+
+```
+could not write ProjectilesPerShot:
+  Unable to cast Python instance of type <class 'float'> to C++ type 'int'
+```
+
+That single difference is why spread visibly widened in game while the
+projectile count did nothing — the two knobs go through identical code. Writes
+now coerce to the type the member already holds (`_match_type`).
+
+This was a **self-inflicted regression**: the earlier writer tried the value,
+then `int`, then `float`, and the rewrite that added `Value` support replaced
+that with a hard `float()`. A retry loop was doing real work and its removal
+went unnoticed because the tests only ever used float members.
+
+### Scaling anchors, it does not re-base
+
+The same run showed `damage expected 75.9161 but reads 91.6948` — the engine
+recomputes `Damage` from `BaseValue`. Re-basing on the current value each pass
+therefore scales the previous result, and the number shrinks on every scan.
+Scaling is now anchored to the value first seen: always `anchor * scale`. Buffs
+still work, applied by the engine on top of the base we set, rather than by us
+chasing them.
+
+The general lesson, now paid for several times over: **a property is not a
+number, a number is not the number, and the numbers are not the same type.**
+Probe the live object before writing.
 
 ### The item card follows for free
 

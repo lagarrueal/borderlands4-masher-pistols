@@ -144,7 +144,7 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-97 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+103 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.
@@ -169,8 +169,11 @@ These cover the mod's logic. They cannot cover the live object graph — see
   change, though: see below.
 - **The values are attribute structs, not numbers.** `ProjectilesPerShot`,
   `Damage` and `Spread` read back as structs carrying both a `Value` (what the
-  game uses) and a `BaseValue`. The mod writes both, scaling rather than
-  assigning so the modifier chain survives. `masher probe` dumps them in full.
+  game uses) and a `BaseValue`, and they are not all the same type —
+  `ProjectilesPerShot` is an integer attribute while `Damage` and `Spread` are
+  floats. The mod writes both members, matching each one's type, and scales
+  from a fixed anchor so repeated passes cannot drift. `masher probe` dumps
+  them in full.
 - Disabling the mod restores every gun it touched.
 
 ## Licence
