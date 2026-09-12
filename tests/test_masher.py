@@ -78,6 +78,7 @@ def reset_mod() -> None:
     jm._ownership_warned = False
     jm._resolved_fields.clear()
     jm._missing_reported.clear()
+    jm._shape_reported.clear()
     env.reset_world()
 
 
@@ -320,7 +321,7 @@ check(
 )
 check(
     "resolution is remembered",
-    jm._resolved_fields["projectiles"] == "ProjectilesPerShot",
+    jm._resolved_fields["projectiles"] == ("ProjectilesPerShot", None),
     str(jm._resolved_fields),
 )
 
@@ -385,6 +386,117 @@ check(
 )
 jm.restore_all()
 check("partial application still restores", half.ProjectilesPerShot == 1)
+
+# --------------------------------------------------------------------------- #
+# In game these properties are not numbers. Reading one yields a WrappedStruct
+# (a Gbx attribute value), and writing an int fails outright. This is the shape
+# the mod actually meets.
+print("\n== values behind attribute structs ==")
+
+
+def make_struct_weapon(scalar_name="BaseValue", projectiles=1, damage=100.0, spread=1.0):
+    weapon = env.FakeObject(
+        "OakWeapon",
+        path=f"World.Struct_{env._NEXT_ADDR[0]}",
+        BodyData="/Game/Gear/Weapons/Pistols/JAK/Body_JAK_PS.Body_JAK_PS",
+    )
+    weapon._props["GetPartValue"] = env.BoundFunction(lambda s: (1, 2, 3, 4)[s % 4])
+    behaviour = env.FakeObject(
+        "WeaponBehavior_FireProjectile",
+        path=f"{weapon._path_name()}.Fire",
+        outer=weapon,
+        ProjectilesPerShot=env.WrappedStruct(**{scalar_name: projectiles}),
+        Damage=env.WrappedStruct(**{scalar_name: damage}),
+        Spread=env.WrappedStruct(**{scalar_name: spread}),
+    )
+    return weapon, behaviour
+
+
+reset_mod()
+jm.masher_frequency.value = 4
+sw, sb = make_struct_weapon()
+
+applied = jm.make_masher(sb)
+check(
+    "struct-valued knobs resolve to their scalar",
+    applied
+    == ["ProjectilesPerShot.BaseValue", "Damage.BaseValue", "Spread.BaseValue"],
+    str(applied),
+)
+check(
+    "resolution records the subfield",
+    jm._resolved_fields["projectiles"] == ("ProjectilesPerShot", "BaseValue"),
+    str(jm._resolved_fields["projectiles"]),
+)
+check("projectiles written through the struct", sb.ProjectilesPerShot.BaseValue == 6)
+check(
+    "damage scaled through the struct",
+    abs(sb.Damage.BaseValue - 40.0) < 1e-6,
+    str(sb.Damage.BaseValue),
+)
+check(
+    "spread widened through the struct",
+    abs(sb.Spread.BaseValue - 3.0) < 1e-6,
+    str(sb.Spread.BaseValue),
+)
+
+# Repeated application must not compound through the struct either.
+for _ in range(5):
+    jm.make_masher(sb)
+check(
+    "struct damage does not compound",
+    abs(sb.Damage.BaseValue - 40.0) < 1e-6,
+    str(sb.Damage.BaseValue),
+)
+
+jm.restore_all()
+check("struct projectiles restored", sb.ProjectilesPerShot.BaseValue == 1)
+check(
+    "struct damage restored",
+    abs(sb.Damage.BaseValue - 100.0) < 1e-6,
+    str(sb.Damage.BaseValue),
+)
+
+# A differently-named scalar still resolves.
+reset_mod()
+jm.masher_frequency.value = 4
+sw2, sb2 = make_struct_weapon(scalar_name="Constant")
+applied = jm.make_masher(sb2)
+check(
+    "an alternate struct scalar resolves",
+    applied and applied[0] == "ProjectilesPerShot.Constant",
+    str(applied),
+)
+check("alternate scalar written", sb2.ProjectilesPerShot.Constant == 6)
+
+# A struct with no numeric field is reported, not silently skipped.
+reset_mod()
+opaque_weapon = env.FakeObject(
+    "OakWeapon", path="World.Opaque", BodyData="Body_JAK_PS"
+)
+opaque = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Opaque.Fire",
+    outer=opaque_weapon,
+    ProjectilesPerShot=env.WrappedStruct(SomeHandle="not a number", Flags="x"),
+)
+applied = jm.make_masher(opaque)
+check("an opaque struct applies nothing", applied == [], str(applied))
+check(
+    "and its shape is reported",
+    "ProjectilesPerShot" in jm._shape_reported,
+    str(jm._shape_reported),
+)
+
+# End to end through the sweep, with the realistic shape.
+reset_mod()
+jm.masher_frequency.value = 4
+pc, pawn = make_player()
+e2e_weapon, e2e_beh = make_struct_weapon()
+e2e_weapon._props["WeaponUser"] = pawn
+found = jm.scan_all()
+check("sweep converts a struct-valued weapon", e2e_beh.ProjectilesPerShot.BaseValue == 6)
+env.set_player(None)
 
 # --------------------------------------------------------------------------- #
 print("\n== applying and restoring ==")

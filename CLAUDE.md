@@ -80,6 +80,39 @@ all** — that absence is precisely why BL4 has no Masher.
 
 Hence the runtime approach.
 
+### Why not a `.pak` mod, like `bl4-xp-mod`?
+
+Worth re-asking, since that is the house style in this repo. The XP mod works by
+**repointing an existing cell** to a different pooled string — it never adds
+anything. That technique needs the cell to already exist.
+
+Counted over the expanded `inv4` JSON (`bl4 ncs show --json`, which unlike the
+text output does expand child part records):
+
+```
+63 records set projectilespershot
+ 0 of them are JAK
+```
+
+Every one is a shotgun, a launcher, or an underbarrel — `VLA_Shotgun`
+(`constant: 6.000000`), `BOR_Atlas`, `DAD_Microrocket`, and so on. **No Jakobs
+pistol record carries the key at all**, so there is no cell to repoint. Giving
+one to `jak_ps` means adding a new key to a record, which is exactly the
+re-encoder wall.
+
+Adjacent ideas, and why they fail:
+
+- *Repoint `attributetomodify` on an existing `jak_ps` aspect to
+  `weapon_projectile_per_shot`.* The only candidates are the Jakobs damage
+  multiplier and the ricochet params, so it would trade the Masher for broken
+  Jakobs damage or ricochet — and the paired `modifiervalue` is a data-table
+  reference, not a constant, so the number would be wrong anyway.
+- *Patch the `Weapon_SG_Barrel_Init` data table.* Pistols never reference it.
+
+So the SDK route is not a shortcut here; it is the only route. The trade is
+real, though, and worth stating: a pak mod would persist without Python and
+survive in a vanilla install, where this one needs the SDK and is host-only.
+
 ## Two offline reflection tricks
 
 Both far faster than probing in game, and they turn guesses into certainties.
@@ -229,6 +262,34 @@ verification signal.**
 could never show it. Wrong on both counts, and checkable in the data the whole
 time.)
 
+### The values are attribute structs, not numbers
+
+Fourth in-game run, with the property names finally resolving:
+
+```
+'projectiles' resolved to property 'ProjectilesPerShot'
+could not write ProjectilesPerShot = 6: Unable to cast Python instance of
+  type <class 'int'> to C++ type 'unrealsdk::unreal::WrappedStruct'
+could not read Damage: float() argument must be ... not 'WrappedStruct'
+```
+
+All three properties **exist**. They are not scalars. That matches the NCS,
+where the fire aspect stores `projectilespershot: {constant: 0.0,
+datatablevalue: {...}}` — a value that can come from a constant, an attribute,
+or a data-table cell. The binary names the type: `GbxAttributeFloat` and
+`GbxAttributeInteger`, both deriving `GbxAttributeBase`, whose scalar member is
+**`BaseValue`**.
+
+So reads and writes go through `_read_scalar` / `_write_scalar`, which accept a
+plain number or reach into the struct (`BaseValue`, then `Value`, `Constant`,
+`BaseValueConstant`). Writes assign the struct back after mutating it, since a
+struct read from a property may be a copy. A struct with no numeric field logs
+its entire field list rather than failing silently.
+
+**Note the shape of this bug:** three rounds of "the property is missing" were
+actually "the property is a different type than assumed". Reflection tells you a
+name exists; it does not tell you the type. Read one before writing it.
+
 ### Enemies hold weapons too
 
 `scan_all()` sees every weapon actor in the level. Converting them all makes
@@ -292,19 +353,18 @@ sessions now:
 | Does the graph walk find the tag? | **Yes** — Jakobs pistols identified |
 | Which property links weapon to holder? | `WeaponUser` |
 | Is `GetPartValue` callable? | Yes — 16 slots |
-| Are `Damage`/`Spread` on the behaviour? | Almost certainly **not** |
+| Are `Damage`/`Spread` on the behaviour? | **Yes** — as `GbxAttribute*` structs |
+| What type are the values? | Structs; scalar is `BaseValue` |
+| Does the card show `{dmg} x {proj}`? | Yes, keyed on `weapon_projectile_per_shot` |
 
 **Still open:**
 
-- **Whether `ProjectilesPerShot` actually writes.** The property exists in the
-  binary and the NCS attribute table points at it, but the last run could not
-  say whether the write failed or the property was absent. `masher status` now
-  prints the resolved property per knob, and a failure prints the behaviour's
-  entire field list.
-- **How to scale per-projectile damage.** If `Damage` is not on the behaviour,
-  a Masher is 6x total damage rather than 2.4x. The honest fallbacks are
-  lowering the projectile count, or driving `weapon_damage` through the
-  attribute system — which means finding the attribute-modifier API.
+- **Whether writing `BaseValue` takes effect.** The struct is reachable and
+  writable; whether the game re-resolves the value from its `datatablevalue`
+  afterwards is not yet known. If it does, the write must move to the Def or to
+  an attribute modifier.
+- **Whether `Damage`'s struct is the per-projectile damage** or something the
+  attribute pipeline overwrites each frame.
 - ~~Whether the item card reflects any of it.~~ **Settled — it does.** See
   below.
 - `PlayEffects` has only been observed firing for `OakVehicleWeapon` turrets, so

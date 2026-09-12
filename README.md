@@ -143,15 +143,15 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-78 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+91 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.
 
 Covers Jakobs-pistol detection through nested objects, arrays and reference
 cycles; explicit tags outranking the directory heuristic; ownership filtering;
-knobs resolving to whichever property the engine actually exposes; roll
-stability and distribution; damage not compounding across repeated shots; buffs
+knobs resolving to whichever property the engine actually exposes, including
+values hidden behind attribute structs; roll stability and distribution; damage not compounding across repeated shots; buffs
 surviving a rescale; clean restore; caching; hook fire counting; and graceful
 degradation when properties are missing.
 
@@ -166,12 +166,11 @@ These cover the mod's logic. They cannot cover the live object graph — see
   `inv_name_part` / naming-strategy system keyed on attribute thresholds, and
   renaming means driving that subsystem separately. The **damage row does**
   change, though: see below.
-- **Per-projectile damage may not be adjustable.** `WeaponBehavior_FireProjectile`
-  appears to reflect only `ProjectilesPerShot`; `Damage` and `Spread` are
-  configured on the definition and resolved through the attribute system. If the
-  mod reports no property for them, a Masher is **6x total damage**, not 2.4x —
-  drop **Projectiles Per Shot** to taste until that is solved. `masher status`
-  shows which property each knob resolved to.
+- **The values are attribute structs, not numbers.** `ProjectilesPerShot`,
+  `Damage` and `Spread` all read back as `GbxAttributeFloat`-style structs whose
+  scalar is `BaseValue`; the mod reaches through them. Whether the game
+  re-resolves those values from their data-table source afterwards is the open
+  question — `masher status` shows what each knob resolved to.
 - Disabling the mod restores every gun it touched.
 
 ## Licence

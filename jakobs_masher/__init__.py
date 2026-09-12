@@ -534,14 +534,13 @@ _touched: dict[int, dict[str, Any]] = {}
 _weapon_cache: dict[int, tuple[str, list[WeakPointer], bool]] = {}
 
 
-# Which property actually carries each knob is not obvious. BL4 reflects very
-# little on a runtime behaviour - the binary's property-name table shows
-# `ProjectilesPerShot` sitting alone between WeaponBehavior_Charge's members
-# and the accuracy behaviour's, suggesting it is the only one on
-# WeaponBehavior_FireProjectile. So each knob has candidates, the first that
-# exists wins, and a knob with no candidate says so loudly instead of failing
-# silently. The first in-game attempt reported "nothing applied" precisely
-# because a failed write was indistinguishable from an absent property.
+# Which property carries each knob is not obvious, and neither is its type.
+# In game these are NOT plain floats: reading one yields a WrappedStruct, and
+# writing an int fails with "Unable to cast ... to WrappedStruct". That matches
+# the NCS, where the fire aspect stores `projectilespershot: {constant: 0.0,
+# datatablevalue: {...}}` - a Gbx attribute value, not a number. The binary
+# names the type: GbxAttributeFloat / GbxAttributeInteger, both deriving
+# GbxAttributeBase, whose scalar member is `BaseValue`.
 FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "projectiles": (
         "ProjectilesPerShot",
@@ -553,73 +552,136 @@ FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "spread": ("Spread", "BaseSpread", "SpreadScale", "SpreadScalar"),
 }
 
-# knob -> the property name that works, or None once we know none do.
-_resolved_fields: dict[str, str | None] = {}
+# The scalar inside a Gbx attribute struct, most likely first.
+STRUCT_SCALAR_CANDIDATES = ("BaseValue", "Value", "Constant", "BaseValueConstant")
 
-# Knobs we have already complained about, so the log stays readable.
+# knob -> (property name, struct subfield or None), or None once we know the
+# knob is unreachable.
+_resolved_fields: dict[str, tuple[str, str | None] | None] = {}
+
+# Knobs and struct shapes we have already complained about.
 _missing_reported: set[str] = set()
+_shape_reported: set[str] = set()
 
 
-def _field_names(obj: UObject) -> list[str]:
-    """Every field name on an object, for diagnostics."""
+def _field_names(obj: Any) -> list[str]:
+    """Every field name on an object or struct, for diagnostics."""
     try:
         return sorted(n for n in dir(obj) if not n.startswith("_"))
     except Exception:
         return []
 
 
-def _report_missing(knob: str, behaviour: UObject) -> None:
-    """Say exactly what the behaviour does expose, once per knob."""
-    if knob in _missing_reported:
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _report_shape(field: str, struct: Any) -> None:
+    """Log a struct we cannot find a scalar in, once per property."""
+    if field in _shape_reported:
         return
-    _missing_reported.add(knob)
+    _shape_reported.add(field)
 
+    log(f"{field} is a struct with no obvious scalar; its fields are:")
+    for name in _field_names(struct):
+        try:
+            value = getattr(struct, name)
+        except Exception as exc:
+            log(f"    {name} = <unreadable: {exc}>")
+            continue
+        log(f"    {name} = {_describe(value)[:120]}")
+
+
+def _read_scalar(obj: UObject, field: str) -> tuple[float, str | None] | None:
+    """Read a number at `obj.field`, reaching into a struct if need be.
+
+    Returns (value, subfield) where subfield is None for a plain scalar, or
+    None if no number is reachable.
+    """
     try:
-        class_name = behaviour.Class.Name
+        raw = getattr(obj, field)
     except Exception:
-        class_name = "?"
+        return None
 
-    names = _field_names(behaviour)
-    log(
-        f"no property for '{knob}' on {class_name}"
-        f" (tried {', '.join(FIELD_CANDIDATES[knob])})"
-    )
-    log(f"  {class_name} exposes {len(names)} field(s): {', '.join(names) or 'none'}")
+    if _is_number(raw):
+        return float(raw), None
+
+    for candidate in STRUCT_SCALAR_CANDIDATES:
+        try:
+            inner = getattr(raw, candidate)
+        except Exception:
+            continue
+        if _is_number(inner):
+            return float(inner), candidate
+
+    _report_shape(field, raw)
+    return None
 
 
-def _resolve_field(behaviour: UObject, knob: str) -> str | None:
-    """The first candidate property for this knob that the object actually has."""
+def _write_scalar(obj: UObject, field: str, subfield: str | None, value: float) -> bool:
+    """Write a number, through the struct when there is one.
+
+    A struct read back from a property may be a copy, so it is assigned back
+    after being modified.
+    """
+    for attempt in (value, float(value), int(value)):
+        try:
+            if subfield is None:
+                setattr(obj, field, attempt)
+            else:
+                struct = getattr(obj, field)
+                setattr(struct, subfield, attempt)
+                setattr(obj, field, struct)
+            return True
+        except Exception as exc:
+            last = exc
+    where = field if subfield is None else f"{field}.{subfield}"
+    log(f"could not write {where} = {value!r}: {last}")
+    return False
+
+
+def _resolve_field(behaviour: UObject, knob: str) -> tuple[str, str | None] | None:
+    """The first candidate property for this knob that yields a number."""
     if knob in _resolved_fields:
         return _resolved_fields[knob]
 
     for candidate in FIELD_CANDIDATES[knob]:
-        try:
-            getattr(behaviour, candidate)
-        except Exception:
+        found = _read_scalar(behaviour, candidate)
+        if found is None:
             continue
-        _resolved_fields[knob] = candidate
-        log(f"'{knob}' resolved to property '{candidate}'")
-        return candidate
+        _, subfield = found
+        _resolved_fields[knob] = (candidate, subfield)
+        where = candidate if subfield is None else f"{candidate}.{subfield}"
+        log(f"'{knob}' resolved to '{where}'")
+        return _resolved_fields[knob]
 
     _resolved_fields[knob] = None
-    _report_missing(knob, behaviour)
+    if knob not in _missing_reported:
+        _missing_reported.add(knob)
+        try:
+            class_name = behaviour.Class.Name
+        except Exception:
+            class_name = "?"
+        names = _field_names(behaviour)
+        log(
+            f"no usable property for '{knob}' on {class_name}"
+            f" (tried {', '.join(FIELD_CANDIDATES[knob])})"
+        )
+        log(f"  {class_name} exposes: {', '.join(names) or 'nothing'}")
     return None
 
 
 def _scale_field(behaviour: UObject, knob: str, scale: float) -> str | None:
-    """Multiply a float property, re-basing if the game changed it under us.
-
-    Returns the property name on success, None otherwise.
-    """
-    field = _resolve_field(behaviour, knob)
-    if field is None:
+    """Multiply a value, re-basing if the game changed it under us."""
+    resolved = _resolve_field(behaviour, knob)
+    if resolved is None:
         return None
+    field, subfield = resolved
 
-    try:
-        current = float(getattr(behaviour, field))
-    except Exception as exc:
-        log(f"could not read {field}: {exc}")
+    found = _read_scalar(behaviour, field)
+    if found is None:
         return None
+    current, _ = found
 
     state = _touched.setdefault(behaviour._get_address(), {})
     previous = state.get(field)
@@ -632,44 +694,38 @@ def _scale_field(behaviour: UObject, knob: str, scale: float) -> str | None:
         base = current
 
     wanted = base * scale
-    try:
-        setattr(behaviour, field, wanted)
-    except Exception as exc:
-        log(f"could not write {field}: {exc}")
+    if not _write_scalar(behaviour, field, subfield, wanted):
         return None
 
-    state[field] = {"original": base, "applied": wanted}
-    return field
+    state[field] = {"original": base, "applied": wanted, "subfield": subfield}
+    return field if subfield is None else f"{field}.{subfield}"
 
 
-def _set_field(behaviour: UObject, knob: str, value: Any) -> str | None:
-    """Set a property outright. Returns the property name on success."""
-    field = _resolve_field(behaviour, knob)
-    if field is None:
+def _set_field(behaviour: UObject, knob: str, value: float) -> str | None:
+    """Set a value outright."""
+    resolved = _resolve_field(behaviour, knob)
+    if resolved is None:
         return None
+    field, subfield = resolved
 
-    try:
-        current = getattr(behaviour, field)
-    except Exception as exc:
-        log(f"could not read {field}: {exc}")
+    found = _read_scalar(behaviour, field)
+    if found is None:
         return None
+    current, _ = found
 
-    try:
-        setattr(behaviour, field, value)
-    except Exception as exc:
-        log(f"could not write {field} = {value!r}: {exc}")
+    if not _write_scalar(behaviour, field, subfield, value):
         return None
 
     state = _touched.setdefault(behaviour._get_address(), {})
     if field not in state:
-        state[field] = {"original": current, "applied": value}
+        state[field] = {"original": current, "applied": value, "subfield": subfield}
     else:
         state[field]["applied"] = value
-    return field
+    return field if subfield is None else f"{field}.{subfield}"
 
 
 def make_masher(behaviour: UObject) -> list[str]:
-    """Turn one fire behaviour into a Masher. Returns the properties that stuck."""
+    """Turn one fire behaviour into a Masher. Returns what actually stuck."""
     applied: list[str] = []
 
     for field in (
@@ -691,16 +747,14 @@ def restore_all() -> None:
         if not state:
             continue
         for field, record in state.items():
-            try:
-                setattr(behaviour, field, record["original"])
-            except Exception:
-                continue
+            _write_scalar(behaviour, field, record.get("subfield"), record["original"])
         restored += 1
     _touched.clear()
     _weapon_cache.clear()
     _identity_cache.clear()
     _resolved_fields.clear()
     _missing_reported.clear()
+    _shape_reported.clear()
     if restored:
         log(f"restored {restored} weapon(s)")
 
@@ -980,8 +1034,15 @@ def masher_command(args: Any) -> None:
         log(f"GetPartValue usable: {_part_values_work}")
         log(f"ownership link: {_ownership_field or 'not established'}")
         for knob in FIELD_CANDIDATES:
-            resolved = _resolved_fields.get(knob, "not looked up yet")
-            log(f"  {knob:<12} -> {resolved if resolved else 'NO PROPERTY FOUND'}")
+            if knob not in _resolved_fields:
+                log(f"  {knob:<12} -> not looked up yet")
+                continue
+            resolved = _resolved_fields[knob]
+            if resolved is None:
+                log(f"  {knob:<12} -> NO USABLE PROPERTY")
+            else:
+                field, subfield = resolved
+                log(f"  {knob:<12} -> {field}{'.' + subfield if subfield else ''}")
         log("hook activity:")
         for hook_obj in HOOKS:
             for func_name, _hook_type in hook_obj.hook_funcs:

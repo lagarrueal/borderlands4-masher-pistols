@@ -129,8 +129,42 @@ class WeakPointer:
         self._obj = None
 
 
-class WrappedStruct:  # noqa: D101
-    pass
+class WrappedStruct:
+    """A Gbx attribute struct: fields, an address, but no path name.
+
+    Modelled on what the game actually hands back - reading
+    `behaviour.ProjectilesPerShot` yields one of these, not a number, which is
+    what broke the first working build.
+    """
+
+    def __init__(self, **fields: Any) -> None:
+        object.__setattr__(self, "_fields", dict(fields))
+        _NEXT_ADDR[0] += 0x40
+        object.__setattr__(self, "_addr", _NEXT_ADDR[0])
+
+    def _get_address(self) -> int:
+        return object.__getattribute__(self, "_addr")
+
+    def __getattr__(self, name: str) -> Any:
+        fields = object.__getattribute__(self, "_fields")
+        if name in fields:
+            return fields[name]
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        fields = object.__getattribute__(self, "_fields")
+        if name not in fields:
+            raise AttributeError(f"no such struct field {name}")
+        fields[name] = value
+
+    def __dir__(self) -> list[str]:
+        return list(object.__getattribute__(self, "_fields"))
+
+    def __repr__(self) -> str:
+        return f"WrappedStruct({object.__getattribute__(self, '_fields')})"
 
 
 class UObject(FakeObject):  # type: ignore[misc]
