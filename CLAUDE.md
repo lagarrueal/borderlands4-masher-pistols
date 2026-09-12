@@ -180,6 +180,28 @@ first, which legitimately have no tag, so the negative result was cached
 permanently and every later weapon failed. Discovery must never cache a
 negative derived from one sample.
 
+### The behaviour reflects almost nothing
+
+Third in-game run: identification worked, two Mashers were found, and the mod
+applied **nothing** — `-> 6 projectiles (nothing applied)`.
+
+The binary's property-name table explains it. `ProjectilesPerShot` sits alone
+between `WeaponBehavior_Charge`'s members (`ChargeState`, `NumStackCharges`)
+and the accuracy behaviour's (`MovementAccuracyMaxValue`, …), which means
+`WeaponBehavior_FireProjectile` reflects roughly **one** property. `Damage` and
+`Spread` are configured on the *Def* and resolved through the attribute system;
+they are not fields on the live behaviour.
+
+So each knob now has a candidate list (`FIELD_CANDIDATES`), resolves to the
+first property the object actually has, and a knob with no candidate logs the
+behaviour's class and its complete field list rather than failing silently. The
+old code could not distinguish "write failed" from "property absent", which is
+why one line of log took a whole session to explain.
+
+`_touched` also used to book an entry *before* attempting the write, so
+`behaviours modified: 2` was reported while nothing had been modified. It now
+records only successful writes.
+
 ### Enemies hold weapons too
 
 `scan_all()` sees every weapon actor in the level. Converting them all makes
@@ -240,18 +262,25 @@ sessions now:
 | Does `scan_all()` reach weapons? | Yes — 6–10 `OakWeapon` actors per sweep |
 | Does a weapon carry its type as a property? | **No** — hence the graph walk |
 | Does `owning_weapon()` work? | Yes — behaviours resolve to their actor |
+| Does the graph walk find the tag? | **Yes** — Jakobs pistols identified |
+| Which property links weapon to holder? | `WeaponUser` |
+| Is `GetPartValue` callable? | Yes — 16 slots |
+| Are `Damage`/`Spread` on the behaviour? | Almost certainly **not** |
 
 **Still open:**
 
-- **Whether the graph walk finds the tag.** It is the fix for the one confirmed
-  blocker, but the depth, node cap and skip-list are reasoned, not measured.
-  `masher dump` prints the graph's tags, gear paths, and a raw sample when
-  neither turns up — that names the fix in one run.
-- **Which property links a weapon to its holder.** Four candidates are tried;
-  the winner is logged and shown in `masher status`. Until one matches,
-  ownership is undecidable and everything converts, with a warning.
-- **Whether `Damage` stays where it is written** between shots, or is recomputed
-  fast enough that six full-damage projectiles come out. Visible immediately if
-  wrong.
+- **Whether `ProjectilesPerShot` actually writes.** The property exists in the
+  binary and the NCS attribute table points at it, but the last run could not
+  say whether the write failed or the property was absent. `masher status` now
+  prints the resolved property per knob, and a failure prints the behaviour's
+  entire field list.
+- **How to scale per-projectile damage.** If `Damage` is not on the behaviour,
+  a Masher is 6x total damage rather than 2.4x. The honest fallbacks are
+  lowering the projectile count, or driving `weapon_damage` through the
+  attribute system — which means finding the attribute-modifier API.
+- **Whether the item card reflects any of it.** The card reads the attribute
+  `weapon_projectile_per_shot`, which resolves *from* `ProjectilesPerShot`, so
+  it may follow automatically — or the pistol card may simply have no
+  projectile-count row, since no stock pistol has one.
 - `PlayEffects` has only been observed firing for `OakVehicleWeapon` turrets, so
-  it is not yet confirmed to fire for player guns. The keybind covers this.
+  it is still not confirmed to fire for player guns. The keybind covers this.

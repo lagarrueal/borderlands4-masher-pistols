@@ -76,6 +76,8 @@ def reset_mod() -> None:
     jm._part_values_work = None
     jm._ownership_field = None
     jm._ownership_warned = False
+    jm._resolved_fields.clear()
+    jm._missing_reported.clear()
     env.reset_world()
 
 
@@ -302,6 +304,89 @@ check("about a quarter at frequency 1", 0.13 < ratio1 < 0.37, f"{ratio1:.1%}")
 jm.masher_frequency.value = 2
 
 # --------------------------------------------------------------------------- #
+# The second in-game run applied nothing and could not say why: a failed write
+# was indistinguishable from an absent property. Each knob now resolves to
+# whichever candidate property the object actually has.
+print("\n== knobs resolve to whatever property exists ==")
+reset_mod()
+jm.masher_frequency.value = 4
+
+w, b = make_weapon("JAK_PS", (1, 2, 3, 4))
+applied = jm.make_masher(b)
+check(
+    "standard names resolve",
+    applied == ["ProjectilesPerShot", "Damage", "Spread"],
+    str(applied),
+)
+check(
+    "resolution is remembered",
+    jm._resolved_fields["projectiles"] == "ProjectilesPerShot",
+    str(jm._resolved_fields),
+)
+
+# An engine that spells it differently still works.
+reset_mod()
+alt_weapon = env.FakeObject("OakWeapon", path="World.Alt", BodyData="Body_JAK_PS")
+alt = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Alt.Fire",
+    outer=alt_weapon,
+    ProjectileCount=1,
+    BaseDamage=100.0,
+    SpreadScale=1.0,
+)
+applied = jm.make_masher(alt)
+check(
+    "alternate spellings resolve",
+    applied == ["ProjectileCount", "BaseDamage", "SpreadScale"],
+    str(applied),
+)
+check("alternate projectile count applied", alt.ProjectileCount == 6)
+check("alternate damage scaled", abs(alt.BaseDamage - 40.0) < 1e-6, str(alt.BaseDamage))
+
+# A behaviour with none of the candidates reports rather than failing mute.
+reset_mod()
+bare_weapon = env.FakeObject("OakWeapon", path="World.Bare", BodyData="Body_JAK_PS")
+bare = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Bare.Fire",
+    outer=bare_weapon,
+    SomethingElse=1,
+)
+applied = jm.make_masher(bare)
+check("nothing resolves on a bare behaviour", applied == [], str(applied))
+check(
+    "every missing knob is recorded",
+    jm._missing_reported == {"projectiles", "damage", "spread"},
+    str(jm._missing_reported),
+)
+check(
+    "and nothing is recorded as touched",
+    not jm._touched,
+    str(jm._touched),
+)
+
+# Only successful writes count as touched - the old code booked an entry before
+# it knew whether the write would work, which made 'behaviours modified' lie.
+reset_mod()
+half_weapon = env.FakeObject("OakWeapon", path="World.Half", BodyData="Body_JAK_PS")
+half = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Half.Fire",
+    outer=half_weapon,
+    ProjectilesPerShot=1,
+)
+applied = jm.make_masher(half)
+check("the one present knob applies", applied == ["ProjectilesPerShot"], str(applied))
+check(
+    "touched records only what was written",
+    list(jm._touched.values())[0].keys() == {"ProjectilesPerShot"},
+    str(jm._touched),
+)
+jm.restore_all()
+check("partial application still restores", half.ProjectilesPerShot == 1)
+
+# --------------------------------------------------------------------------- #
 print("\n== applying and restoring ==")
 reset_mod()
 w, b = make_weapon("JAK_PS", (1, 1, 1, 1), damage=100.0, spread=1.0)
@@ -477,7 +562,7 @@ check("scan keybind registered", len(kbs) == 1 and kbs[0].name == "Scan Weapons 
 
 cmds = env.sys.modules["mods_base"].REGISTERED["commands"]
 check("masher command registered", len(cmds) == 1 and cmds[0].cmd == "masher")
-for action in ("dump", "status", "scan", "restore"):
+for action in ("dump", "status", "scan", "mine", "restore"):
     try:
         cmds[0](action)
         check(f"'masher {action}' runs", True)

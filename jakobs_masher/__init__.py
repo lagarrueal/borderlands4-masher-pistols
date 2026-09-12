@@ -534,16 +534,94 @@ _touched: dict[int, dict[str, Any]] = {}
 _weapon_cache: dict[int, tuple[str, list[WeakPointer], bool]] = {}
 
 
-def _scale_field(behaviour: UObject, field: str, scale: float) -> bool:
-    """Multiply a float field, re-basing if the game changed it underneath us."""
-    address = behaviour._get_address()
-    state = _touched.setdefault(address, {})
+# Which property actually carries each knob is not obvious. BL4 reflects very
+# little on a runtime behaviour - the binary's property-name table shows
+# `ProjectilesPerShot` sitting alone between WeaponBehavior_Charge's members
+# and the accuracy behaviour's, suggesting it is the only one on
+# WeaponBehavior_FireProjectile. So each knob has candidates, the first that
+# exists wins, and a knob with no candidate says so loudly instead of failing
+# silently. The first in-game attempt reported "nothing applied" precisely
+# because a failed write was indistinguishable from an absent property.
+FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "projectiles": (
+        "ProjectilesPerShot",
+        "ProjectilesperShot",
+        "ProjectileCount",
+        "NumProjectiles",
+    ),
+    "damage": ("Damage", "BaseDamage", "DamageScale", "DamageScalar"),
+    "spread": ("Spread", "BaseSpread", "SpreadScale", "SpreadScalar"),
+}
+
+# knob -> the property name that works, or None once we know none do.
+_resolved_fields: dict[str, str | None] = {}
+
+# Knobs we have already complained about, so the log stays readable.
+_missing_reported: set[str] = set()
+
+
+def _field_names(obj: UObject) -> list[str]:
+    """Every field name on an object, for diagnostics."""
+    try:
+        return sorted(n for n in dir(obj) if not n.startswith("_"))
+    except Exception:
+        return []
+
+
+def _report_missing(knob: str, behaviour: UObject) -> None:
+    """Say exactly what the behaviour does expose, once per knob."""
+    if knob in _missing_reported:
+        return
+    _missing_reported.add(knob)
+
+    try:
+        class_name = behaviour.Class.Name
+    except Exception:
+        class_name = "?"
+
+    names = _field_names(behaviour)
+    log(
+        f"no property for '{knob}' on {class_name}"
+        f" (tried {', '.join(FIELD_CANDIDATES[knob])})"
+    )
+    log(f"  {class_name} exposes {len(names)} field(s): {', '.join(names) or 'none'}")
+
+
+def _resolve_field(behaviour: UObject, knob: str) -> str | None:
+    """The first candidate property for this knob that the object actually has."""
+    if knob in _resolved_fields:
+        return _resolved_fields[knob]
+
+    for candidate in FIELD_CANDIDATES[knob]:
+        try:
+            getattr(behaviour, candidate)
+        except Exception:
+            continue
+        _resolved_fields[knob] = candidate
+        log(f"'{knob}' resolved to property '{candidate}'")
+        return candidate
+
+    _resolved_fields[knob] = None
+    _report_missing(knob, behaviour)
+    return None
+
+
+def _scale_field(behaviour: UObject, knob: str, scale: float) -> str | None:
+    """Multiply a float property, re-basing if the game changed it under us.
+
+    Returns the property name on success, None otherwise.
+    """
+    field = _resolve_field(behaviour, knob)
+    if field is None:
+        return None
 
     try:
         current = float(getattr(behaviour, field))
-    except Exception:
-        return False
+    except Exception as exc:
+        log(f"could not read {field}: {exc}")
+        return None
 
+    state = _touched.setdefault(behaviour._get_address(), {})
     previous = state.get(field)
     if previous is not None and abs(current - previous["applied"]) < 1e-4:
         # Still holding our value, and the scale may have changed in the menu.
@@ -556,43 +634,51 @@ def _scale_field(behaviour: UObject, field: str, scale: float) -> bool:
     wanted = base * scale
     try:
         setattr(behaviour, field, wanted)
-    except Exception:
-        return False
+    except Exception as exc:
+        log(f"could not write {field}: {exc}")
+        return None
 
     state[field] = {"original": base, "applied": wanted}
-    return True
+    return field
 
 
-def _set_field(behaviour: UObject, field: str, value: Any) -> bool:
-    address = behaviour._get_address()
-    state = _touched.setdefault(address, {})
+def _set_field(behaviour: UObject, knob: str, value: Any) -> str | None:
+    """Set a property outright. Returns the property name on success."""
+    field = _resolve_field(behaviour, knob)
+    if field is None:
+        return None
+
     try:
         current = getattr(behaviour, field)
-    except Exception:
-        return False
+    except Exception as exc:
+        log(f"could not read {field}: {exc}")
+        return None
 
+    try:
+        setattr(behaviour, field, value)
+    except Exception as exc:
+        log(f"could not write {field} = {value!r}: {exc}")
+        return None
+
+    state = _touched.setdefault(behaviour._get_address(), {})
     if field not in state:
         state[field] = {"original": current, "applied": value}
     else:
         state[field]["applied"] = value
-
-    try:
-        setattr(behaviour, field, value)
-    except Exception:
-        return False
-    return True
+    return field
 
 
 def make_masher(behaviour: UObject) -> list[str]:
-    """Turn one fire behaviour into a Masher. Returns the fields that stuck."""
+    """Turn one fire behaviour into a Masher. Returns the properties that stuck."""
     applied: list[str] = []
 
-    if _set_field(behaviour, "ProjectilesPerShot", int(projectiles.value)):
-        applied.append("ProjectilesPerShot")
-    if _scale_field(behaviour, "Damage", float(damage_scale.value)):
-        applied.append("Damage")
-    if _scale_field(behaviour, "Spread", float(spread_scale.value)):
-        applied.append("Spread")
+    for field in (
+        _set_field(behaviour, "projectiles", int(projectiles.value)),
+        _scale_field(behaviour, "damage", float(damage_scale.value)),
+        _scale_field(behaviour, "spread", float(spread_scale.value)),
+    ):
+        if field is not None:
+            applied.append(field)
 
     return applied
 
@@ -613,6 +699,8 @@ def restore_all() -> None:
     _touched.clear()
     _weapon_cache.clear()
     _identity_cache.clear()
+    _resolved_fields.clear()
+    _missing_reported.clear()
     if restored:
         log(f"restored {restored} weapon(s)")
 
@@ -672,12 +760,11 @@ def owning_weapon(behaviour: UObject) -> UObject | None:
     return None
 
 
-def scan_all() -> int:
-    """Process every live weapon, without relying on any hook firing.
+def live_weapons() -> dict[int, tuple[UObject, list[UObject]]]:
+    """Every live weapon that owns a fire behaviour, keyed by address.
 
-    This is the fallback the keybind and `masher scan` use. It walks from the
-    fire behaviours rather than from a weapon class name, so it does not care
-    what the weapon actor is actually called.
+    Walks up from the behaviours rather than down from a weapon class name, so
+    it does not care what the weapon actor is actually called.
     """
     by_weapon: dict[int, tuple[UObject, list[UObject]]] = {}
 
@@ -692,6 +779,16 @@ def scan_all() -> int:
             continue
         entry = by_weapon.setdefault(weapon._get_address(), (weapon, []))
         entry[1].append(behaviour)
+
+    return by_weapon
+
+
+def scan_all() -> int:
+    """Process every live weapon, without relying on any hook firing.
+
+    This is what the keybind and `masher scan` use.
+    """
+    by_weapon = live_weapons()
 
     for weapon, behaviours in by_weapon.values():
         try:
@@ -882,6 +979,9 @@ def masher_command(args: Any) -> None:
         log(f"weapons identified: {len(_identity_cache)}")
         log(f"GetPartValue usable: {_part_values_work}")
         log(f"ownership link: {_ownership_field or 'not established'}")
+        for knob in FIELD_CANDIDATES:
+            resolved = _resolved_fields.get(knob, "not looked up yet")
+            log(f"  {knob:<12} -> {resolved if resolved else 'NO PROPERTY FOUND'}")
         log("hook activity:")
         for hook_obj in HOOKS:
             for func_name, _hook_type in hook_obj.hook_funcs:
@@ -898,6 +998,48 @@ def masher_command(args: Any) -> None:
     if args.action == "scan":
         found = scan_all()
         log(f"scanned {found} weapon(s)")
+        return
+
+    if args.action == "mine":
+        # Weapons have no readable display name, so the next best answer to
+        # "which of my guns is a Masher" is to list them with their live
+        # projectile count - that is the number the effect actually changes.
+        mine = [
+            (weapon, behaviours)
+            for weapon, behaviours in live_weapons().values()
+            if is_player_weapon(weapon) is not False
+        ]
+        if not mine:
+            log("you are not carrying anything with a fire behaviour")
+            return
+
+        log(f"{len(mine)} weapon(s) you are carrying:")
+        for weapon, behaviours in mine:
+            jakobs = is_jakobs_pistol(weapon)
+            tags = sorted(
+                {
+                    match.group(0).upper()
+                    for text in collect_identity(weapon)
+                    for match in WEAPON_TAG_RE.finditer(text)
+                }
+            )
+            cached = _weapon_cache.get(weapon._get_address())
+            masher = cached[2] if cached else None
+
+            counts = []
+            field = _resolved_fields.get("projectiles")
+            for behaviour in behaviours:
+                try:
+                    counts.append(str(getattr(behaviour, field or "ProjectilesPerShot")))
+                except Exception:
+                    counts.append("?")
+
+            log(
+                f"  {'/'.join(tags) or 'untagged':<10}"
+                f" jakobs_pistol={jakobs}"
+                f" masher={masher}"
+                f" projectiles={','.join(counts)}"
+            )
         return
 
     if args.action == "restore":
@@ -984,10 +1126,11 @@ masher_command.add_argument(
     "action",
     nargs="?",
     default="dump",
-    choices=("dump", "status", "scan", "restore"),
+    choices=("dump", "status", "scan", "mine", "restore"),
     help=(
         "dump the live weapon data, show mod status and hook activity,"
-        " scan every loaded weapon now, or undo all changes"
+        " scan every loaded weapon now, list the guns you are carrying,"
+        " or undo all changes"
     ),
 )
 

@@ -49,6 +49,17 @@ All are live-adjustable from the mods menu.
 | Masher Frequency (in 4) | 1 | roughly a quarter of Jakobs revolvers |
 | Player Weapons Only | On | do not turn enemy revolvers into Mashers too |
 
+### Telling which gun is a Masher
+
+There is no visual cue yet — see **Caveats**. `masher mine` lists what you are
+carrying, with each gun's manufacturer/class tag and its live projectile count:
+
+```
+2 weapon(s) you are carrying:
+  JAK_PS     jakobs_pistol=True   masher=True   projectiles=6
+  TED_AR     jakobs_pistol=False  masher=None   projectiles=1
+```
+
 ### Which revolvers become Mashers
 
 The decision is derived from the weapon's **part indices** — the same numbers
@@ -82,8 +93,9 @@ The console key on this install is **F10**.
 
 ```
 masher dump      # print the live fire behaviours, their properties and owners
-masher status    # what the mod found, plus the hook activity table
+masher status    # what the mod found: hooks, ownership link, resolved properties
 masher scan      # apply to every loaded weapon now, ignoring hooks
+masher mine      # list the guns you are carrying, and which are Mashers
 masher restore   # undo every change without disabling the mod
 ```
 
@@ -116,16 +128,17 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-66 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+78 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.
 
 Covers Jakobs-pistol detection through nested objects, arrays and reference
 cycles; explicit tags outranking the directory heuristic; ownership filtering;
-roll stability and distribution; damage not compounding across repeated shots;
-buffs surviving a rescale; clean restore; caching; hook fire counting; and
-graceful degradation when properties are missing.
+knobs resolving to whichever property the engine actually exposes; roll
+stability and distribution; damage not compounding across repeated shots; buffs
+surviving a rescale; clean restore; caching; hook fire counting; and graceful
+degradation when properties are missing.
 
 These cover the mod's logic. They cannot cover the live object graph — see
 **Caveats**.
@@ -134,14 +147,18 @@ These cover the mod's logic. They cannot cover the live object graph — see
 
 - **Host only.** The change is applied where the shot is resolved, so in co-op
   it affects the host's own guns.
-- **The item card still reads "Jakobs Pistol".** Weapon names come from the
-  `inv_name_part` / naming-strategy system keyed on attribute thresholds;
-  renaming would mean driving that subsystem separately.
-- **Some things are still unconfirmed in game.** Whether the object-graph walk
-  reaches a weapon's type tag; which property links a weapon to its holder (four
-  are tried, and the mod warns if none match); and whether `Damage` stays where
-  it is written between shots. All of them fail visibly, and `masher dump` is
-  written to answer them in one run. `CLAUDE.md` tracks what is settled.
+- **The item card still reads "Jakobs Pistol", and will not show "x6".** Weapon
+  names come from the `inv_name_part` / naming-strategy system keyed on
+  attribute thresholds; renaming means driving that subsystem separately. As for
+  the damage number: the card shows *per projectile* damage, so a working Masher
+  makes it go **down**, not up — BL3 showed `damage x6` because its card had a
+  projectile row, and no stock BL4 pistol has one. Use `masher mine` meanwhile.
+- **Per-projectile damage may not be adjustable.** `WeaponBehavior_FireProjectile`
+  appears to reflect only `ProjectilesPerShot`; `Damage` and `Spread` are
+  configured on the definition and resolved through the attribute system. If the
+  mod reports no property for them, a Masher is **6x total damage**, not 2.4x —
+  drop **Projectiles Per Shot** to taste until that is solved. `masher status`
+  shows which property each knob resolved to.
 - Disabling the mod restores every gun it touched.
 
 ## Licence
