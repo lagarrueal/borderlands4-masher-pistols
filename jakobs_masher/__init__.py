@@ -476,14 +476,22 @@ def part_values(weapon: UObject) -> tuple[int, ...]:
 
 
 def stat_fingerprint(behaviours: list[UObject]) -> tuple[int, ...]:
-    """Fallback identity, from the rolled numbers on the fire behaviour."""
+    """Fallback identity, from the rolled numbers on the fire behaviour.
+
+    Reads through attribute structs like everything else here - these fields
+    are `GbxAttribute*` values, not plain floats, so a naive `float(getattr(...))`
+    yields nothing at all and the roll then always says "not a Masher".
+    """
     values: list[int] = []
     for behaviour in behaviours:
         for field in ("FireRate", "Spread", "ShotAmmoCost", "AutomaticBurstCount"):
-            try:
-                values.append(int(round(float(getattr(behaviour, field)) * 1000)))
-            except Exception:
+            subfields = _probe_property(behaviour, field)
+            if subfields is None:
                 continue
+            value = _read_effective(behaviour, field, subfields)
+            if value is None:
+                continue
+            values.append(int(round(value * 1000)))
     return tuple(values)
 
 
@@ -1210,20 +1218,48 @@ def masher_command(args: Any) -> None:
             cached = _weapon_cache.get(weapon._get_address())
             masher = cached[2] if cached else None
 
-            counts = []
-            field = _resolved_fields.get("projectiles")
-            for behaviour in behaviours:
-                try:
-                    counts.append(str(getattr(behaviour, field or "ProjectilesPerShot")))
-                except Exception:
-                    counts.append("?")
-
             log(
                 f"  {'/'.join(tags) or 'untagged':<10}"
-                f" jakobs_pistol={jakobs}"
-                f" masher={masher}"
-                f" projectiles={','.join(counts)}"
+                f" jakobs_pistol={jakobs} masher={masher}"
             )
+
+            # The item card is built from the item's own stats container, not
+            # from the live behaviour this mod writes to, so it keeps showing
+            # the unmodified numbers. Report the real maths here instead.
+            for behaviour in behaviours:
+                numbers = {}
+                for knob in ("projectiles", "damage", "spread"):
+                    resolved = _resolved_fields.get(knob)
+                    if not resolved:
+                        continue
+                    field, subfields = resolved
+                    value = _read_effective(behaviour, field, subfields)
+                    if value is not None:
+                        numbers[knob] = value
+
+                if "projectiles" not in numbers or "damage" not in numbers:
+                    continue
+
+                count = numbers["projectiles"]
+                per_shot = numbers["damage"]
+                spread_now = numbers.get("spread")
+                log(
+                    f"      {per_shot:.0f} x {count:.0f}"
+                    f"  =  {per_shot * count:.0f} per trigger pull"
+                    + (f"   (spread {spread_now:.2f})" if spread_now else "")
+                )
+
+                record = _touched.get(behaviour._get_address(), {})
+                anchor = None
+                for key, entry in record.items():
+                    if entry["field"] == (_resolved_fields.get("damage") or ("",))[0]:
+                        anchor = entry["original"]
+                        break
+                if anchor:
+                    log(
+                        f"      unmodified it would be {anchor:.0f} x 1"
+                        f"  =  {anchor:.0f}, so this is {per_shot * count / anchor:.2f}x"
+                    )
         return
 
     if args.action == "probe":

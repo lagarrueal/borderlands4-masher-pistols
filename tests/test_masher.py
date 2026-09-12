@@ -850,6 +850,41 @@ for action in ("dump", "status", "scan", "mine", "probe", "restore"):
     except Exception as exc:  # noqa: BLE001
         check(f"'masher {action}' runs", False, repr(exc))
 
+# The item card is built from the item's stats container, not the live
+# behaviour, so it keeps showing unmodified numbers. `masher mine` has to
+# answer "what is my damage now" instead.
+print("\n== masher mine reports the damage maths ==")
+reset_mod()
+jm.masher_frequency.value = 4
+pc, pawn = make_player()
+rep_w = env.FakeObject(
+    "OakWeapon", path="World.Report", BodyData="Body_JAK_PS"
+)
+rep_w._props["WeaponUser"] = pawn
+rep_b = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Report.Fire",
+    outer=rep_w,
+    ProjectilesPerShot=env.WrappedStruct(Value=1, BaseValue=1),
+    Damage=env.WrappedStruct(Value=150.0, BaseValue=150.0),
+    Spread=env.WrappedStruct(Value=1.0, BaseValue=1.0),
+)
+jm.scan_all()
+
+import io
+import contextlib
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    cmds[0]("mine")
+out = buf.getvalue()
+
+check("mine reports per-projectile x count", "60 x 6" in out, out.strip()[-200:])
+check("mine reports the total per trigger pull", "360 per trigger pull" in out, "")
+check("mine reports the multiplier vs unmodified", "2.40x" in out, "")
+env.set_player(None)
+
+# --------------------------------------------------------------------------- #
 mod_kwargs = env.sys.modules["mods_base"].REGISTERED["mod"]
 check("restore wired to disable", mod_kwargs.get("on_disable") is jm.restore_all)
 check("report wired to enable", mod_kwargs.get("on_enable") is jm.on_mod_enabled)

@@ -51,23 +51,27 @@ All are live-adjustable from the mods menu.
 
 ### Telling which gun is a Masher
 
-**The item card tells you.** Every weapon class declares two damage rows and
-picks between them on the `weapon_projectile_per_shot` attribute:
+**The item card does not tell you** — see Caveats. Run `masher mine`, which
+reports what the card omits:
+
+```
+  JAK_PS     jakobs_pistol=True masher=True
+      62 x 6  =  372 per trigger pull   (spread 3.75)
+      unmodified it would be 154 x 1  =  154, so this is 2.40x
+```
+
+For reference, the card *would* pick the right row if it read the live weapon —
+every weapon class declares two damage rows and chooses between them on the
+`weapon_projectile_per_shot` attribute:
 
 | Row | Condition | Renders |
 |---|---|---|
 | `uistat_damage` | `weapon_projectile_per_shot` ≤ 1 | `Damage: 847` |
 | `uistat_damage_and_projectile_count` | `weapon_projectile_per_shot` > 1 | `Damage: 847 x 6` |
 
-That attribute resolves from `WeaponBehavior_FireProjectile.ProjectilesPerShot`
-— exactly what this mod writes — so a working Masher shows **`x 6`** on its card
-with no UI work, the same way a shotgun shows its pellet count. `weapon_ps`
-carries the row already; nothing had to be added.
-
-That also makes the card the verification: no `x 6`, no Masher.
-
-`masher mine` gives the same answer from the console, for all carried guns at
-once:
+— but it resolves that attribute against the **item**, not against the live
+weapon actor, so writing the behaviour does not move it. The backpack has to
+work that way: it draws cards for guns you are not holding.
 
 ```
 2 weapon(s) you are carrying:
@@ -144,7 +148,7 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-103 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+106 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.

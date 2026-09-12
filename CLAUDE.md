@@ -295,7 +295,27 @@ The general lesson, now paid for several times over: **a property is not a
 number, a number is not the number, and the numbers are not the same type.**
 Probe the live object before writing.
 
-### The item card follows for free
+### The item card does NOT follow — it reads a different object
+
+Confirmed in game: with `ProjectilesPerShot` working and the gun visibly
+firing six projectiles, **the card still shows the unmodified numbers**.
+
+The card is not built from the live `WeaponBehavior_FireProjectile`. It comes
+from the item's own stats container — `InventoryStatsContainer`,
+`InventoryStatsDef`, `NexusConfigStoreInventoryStats`,
+`InventoryStatsContainerValueResolver`. That has to be true structurally: the
+backpack draws cards for items you are *not* holding, which have no live weapon
+actor at all.
+
+So the `uistat_damage_and_projectile_count` analysis below is correct about
+*how the card decides* — but the attribute it reads resolves against the item,
+not against the behaviour this mod writes to. Changing the card means reaching
+the item's stats container, which is separate work.
+
+`masher mine` reports the real maths instead: per-projectile damage, the count,
+the total per trigger pull, and the multiplier against the unmodified anchor.
+
+### How the card decides (for reference)
 
 `Nexus-Data-ui_stat0.ncs` defines two damage rows whose `displaycondition` is a
 straight comparison on the attribute `weapon_projectile_per_shot`:
