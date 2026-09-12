@@ -322,7 +322,7 @@ check(
 )
 check(
     "resolution is remembered",
-    jm._resolved_fields["projectiles"] == ("ProjectilesPerShot", None),
+    jm._resolved_fields["projectiles"] == ("ProjectilesPerShot", ()),
     str(jm._resolved_fields),
 )
 
@@ -395,7 +395,18 @@ check("partial application still restores", half.ProjectilesPerShot == 1)
 print("\n== values behind attribute structs ==")
 
 
-def make_struct_weapon(scalar_name="BaseValue", projectiles=1, damage=100.0, spread=1.0):
+def make_struct_weapon(scalar_name=None, projectiles=1, damage=100.0, spread=1.0):
+    """A weapon whose values are attribute structs, as the game really has them.
+
+    By default both members are present and equal, which is what an untouched
+    weapon looks like in game.
+    """
+
+    def attr(value):
+        if scalar_name is not None:
+            return env.WrappedStruct(**{scalar_name: value})
+        return env.WrappedStruct(Value=value, BaseValue=value)
+
     weapon = env.FakeObject(
         "OakWeapon",
         path=f"World.Struct_{env._NEXT_ADDR[0]}",
@@ -406,9 +417,9 @@ def make_struct_weapon(scalar_name="BaseValue", projectiles=1, damage=100.0, spr
         "WeaponBehavior_FireProjectile",
         path=f"{weapon._path_name()}.Fire",
         outer=weapon,
-        ProjectilesPerShot=env.WrappedStruct(**{scalar_name: projectiles}),
-        Damage=env.WrappedStruct(**{scalar_name: damage}),
-        Spread=env.WrappedStruct(**{scalar_name: spread}),
+        ProjectilesPerShot=attr(projectiles),
+        Damage=attr(damage),
+        Spread=attr(spread),
     )
     return weapon, behaviour
 
@@ -419,26 +430,31 @@ sw, sb = make_struct_weapon()
 
 applied = jm.make_masher(sb)
 check(
-    "struct-valued knobs resolve to their scalar",
+    "struct-valued knobs resolve to their effective member first",
     applied
-    == ["ProjectilesPerShot.BaseValue", "Damage.BaseValue", "Spread.BaseValue"],
+    == ["ProjectilesPerShot.Value", "Damage.Value", "Spread.Value"],
     str(applied),
 )
 check(
-    "resolution records the subfield",
-    jm._resolved_fields["projectiles"] == ("ProjectilesPerShot", "BaseValue"),
+    "resolution records every numeric member",
+    jm._resolved_fields["projectiles"]
+    == ("ProjectilesPerShot", ("Value", "BaseValue")),
     str(jm._resolved_fields["projectiles"]),
 )
-check("projectiles written through the struct", sb.ProjectilesPerShot.BaseValue == 6)
+
+# The bug that cost five sessions: only BaseValue was written, and the game
+# reads Value. Both must move.
+check("effective Value written", sb.ProjectilesPerShot.Value == 6)
+check("BaseValue written too", sb.ProjectilesPerShot.BaseValue == 6)
 check(
-    "damage scaled through the struct",
-    abs(sb.Damage.BaseValue - 40.0) < 1e-6,
-    str(sb.Damage.BaseValue),
+    "damage scaled on both members",
+    abs(sb.Damage.Value - 40.0) < 1e-6 and abs(sb.Damage.BaseValue - 40.0) < 1e-6,
+    f"Value={sb.Damage.Value} BaseValue={sb.Damage.BaseValue}",
 )
 check(
-    "spread widened through the struct",
-    abs(sb.Spread.BaseValue - 3.0) < 1e-6,
-    str(sb.Spread.BaseValue),
+    "spread widened on both members",
+    abs(sb.Spread.Value - 3.0) < 1e-6 and abs(sb.Spread.BaseValue - 3.0) < 1e-6,
+    f"Value={sb.Spread.Value} BaseValue={sb.Spread.BaseValue}",
 )
 
 # Repeated application must not compound through the struct either.
@@ -446,16 +462,20 @@ for _ in range(5):
     jm.make_masher(sb)
 check(
     "struct damage does not compound",
-    abs(sb.Damage.BaseValue - 40.0) < 1e-6,
-    str(sb.Damage.BaseValue),
+    abs(sb.Damage.Value - 40.0) < 1e-6,
+    str(sb.Damage.Value),
 )
 
 jm.restore_all()
-check("struct projectiles restored", sb.ProjectilesPerShot.BaseValue == 1)
 check(
-    "struct damage restored",
-    abs(sb.Damage.BaseValue - 100.0) < 1e-6,
-    str(sb.Damage.BaseValue),
+    "struct projectiles restored on both members",
+    sb.ProjectilesPerShot.Value == 1 and sb.ProjectilesPerShot.BaseValue == 1,
+    f"Value={sb.ProjectilesPerShot.Value} BaseValue={sb.ProjectilesPerShot.BaseValue}",
+)
+check(
+    "struct damage restored on both members",
+    abs(sb.Damage.Value - 100.0) < 1e-6 and abs(sb.Damage.BaseValue - 100.0) < 1e-6,
+    f"Value={sb.Damage.Value} BaseValue={sb.Damage.BaseValue}",
 )
 
 # A differently-named scalar still resolves.
@@ -469,6 +489,25 @@ check(
     str(applied),
 )
 check("alternate scalar written", sb2.ProjectilesPerShot.Constant == 6)
+
+# A ratio between the members must survive scaling - Damage really runs
+# BaseValue 82 / Value 241, and flattening the two would wreck the modifiers.
+reset_mod()
+jm.masher_frequency.value = 4
+ratio_w = env.FakeObject("OakWeapon", path="World.Ratio", BodyData="Body_JAK_PS")
+ratio_b = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Ratio.Fire",
+    outer=ratio_w,
+    Damage=env.WrappedStruct(Value=240.0, BaseValue=80.0),
+)
+jm.make_masher(ratio_b)
+check(
+    "scaling preserves the base/effective ratio",
+    abs(ratio_b.Damage.Value - 96.0) < 1e-6
+    and abs(ratio_b.Damage.BaseValue - 32.0) < 1e-6,
+    f"Value={ratio_b.Damage.Value} BaseValue={ratio_b.Damage.BaseValue}",
+)
 
 # A struct with no numeric field is reported, not silently skipped.
 reset_mod()
@@ -498,7 +537,7 @@ jm.make_masher(db)
 check("no drift right after writing", jm.check_drift(db) == [], str(jm.check_drift(db)))
 
 # Simulate the engine re-resolving the value from its data-table source.
-db.ProjectilesPerShot.BaseValue = 1
+db.ProjectilesPerShot.Value = 1
 drift = jm.check_drift(db)
 check(
     "a reverted value is detected",
@@ -528,7 +567,7 @@ stubborn = env.FakeObject(
     "WeaponBehavior_FireProjectile",
     path="World.Sticky.Fire",
     outer=sticky_w,
-    ProjectilesPerShot=StubbornStruct(BaseValue=1),
+    ProjectilesPerShot=StubbornStruct(Value=1, BaseValue=1),
 )
 jm.make_masher(stubborn)
 check(
@@ -544,7 +583,7 @@ pc, pawn = make_player()
 e2e_weapon, e2e_beh = make_struct_weapon()
 e2e_weapon._props["WeaponUser"] = pawn
 found = jm.scan_all()
-check("sweep converts a struct-valued weapon", e2e_beh.ProjectilesPerShot.BaseValue == 6)
+check("sweep converts a struct-valued weapon", e2e_beh.ProjectilesPerShot.Value == 6)
 env.set_player(None)
 
 # --------------------------------------------------------------------------- #

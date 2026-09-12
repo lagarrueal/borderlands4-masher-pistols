@@ -552,20 +552,29 @@ FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "spread": ("Spread", "BaseSpread", "SpreadScale", "SpreadScalar"),
 }
 
-# The scalar inside a Gbx attribute struct, most likely first.
-STRUCT_SCALAR_CANDIDATES = ("BaseValue", "Value", "Constant", "BaseValueConstant")
+# A Gbx attribute struct carries BOTH a base and an effective value:
+#
+#   untouched Torgue shotgun     modified Jakobs pistol
+#     BaseValue = 3                BaseValue = 6   <- we wrote this
+#     Value     = 3                Value     = 1   <- the game reads this
+#
+# On an untouched weapon the two agree. Writing only `BaseValue` therefore
+# changes nothing observable, which is what five test sessions saw. Every
+# numeric member is written, and scaled rather than assigned where a ratio
+# matters: `Damage` runs BaseValue 82 / Value 241, so the two have to move
+# together or the modifier chain is destroyed.
+STRUCT_SCALARS = ("Value", "BaseValue", "Constant", "BaseValueConstant")
 
-# knob -> (property name, struct subfield or None), or None once we know the
-# knob is unreachable.
-_resolved_fields: dict[str, tuple[str, str | None] | None] = {}
+# knob -> (property name, tuple of struct subfields); the tuple is empty for a
+# plain scalar. None once we know the knob is unreachable.
+_resolved_fields = {}
 
-# Knobs and struct shapes we have already complained about.
-_missing_reported: set[str] = set()
-_shape_reported: set[str] = set()
-_drift_reported: set[int] = set()
+_missing_reported = set()
+_shape_reported = set()
+_drift_reported = set()
 
 
-def _field_names(obj: Any) -> list[str]:
+def _field_names(obj):
     """Every field name on an object or struct, for diagnostics."""
     try:
         return sorted(n for n in dir(obj) if not n.startswith("_"))
@@ -573,31 +582,41 @@ def _field_names(obj: Any) -> list[str]:
         return []
 
 
-def _is_number(value: Any) -> bool:
+def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _report_shape(field: str, struct: Any) -> None:
-    """Log a struct we cannot find a scalar in, once per property."""
+def _report_shape(field, struct):
+    """Log a struct we cannot find a number in, once per property."""
     if field in _shape_reported:
         return
     _shape_reported.add(field)
 
-    log(f"{field} is a struct with no obvious scalar; its fields are:")
+    log(f"{field} is a struct with no numeric field; it holds:")
     for name in _field_names(struct):
         try:
-            value = getattr(struct, name)
+            log(f"    {name} = {_describe(getattr(struct, name))[:120]}")
         except Exception as exc:
             log(f"    {name} = <unreadable: {exc}>")
+
+
+def _scalar_subfields(struct):
+    """The numeric members of an attribute struct, effective value first."""
+    found = []
+    for name in STRUCT_SCALARS:
+        try:
+            if _is_number(getattr(struct, name)):
+                found.append(name)
+        except Exception:
             continue
-        log(f"    {name} = {_describe(value)[:120]}")
+    return tuple(found)
 
 
-def _read_scalar(obj: UObject, field: str) -> tuple[float, str | None] | None:
-    """Read a number at `obj.field`, reaching into a struct if need be.
+def _probe_property(obj, field):
+    """How to reach numbers at obj.field.
 
-    Returns (value, subfield) where subfield is None for a plain scalar, or
-    None if no number is reachable.
+    Returns () for a plain scalar, the struct subfields to use, or None when
+    there is no number there at all.
     """
     try:
         raw = getattr(obj, field)
@@ -605,55 +624,62 @@ def _read_scalar(obj: UObject, field: str) -> tuple[float, str | None] | None:
         return None
 
     if _is_number(raw):
-        return float(raw), None
+        return ()
 
-    for candidate in STRUCT_SCALAR_CANDIDATES:
-        try:
-            inner = getattr(raw, candidate)
-        except Exception:
-            continue
-        if _is_number(inner):
-            return float(inner), candidate
+    subfields = _scalar_subfields(raw)
+    if subfields:
+        return subfields
 
     _report_shape(field, raw)
     return None
 
 
-def _write_scalar(obj: UObject, field: str, subfield: str | None, value: float) -> bool:
-    """Write a number, through the struct when there is one.
+def _read_effective(obj, field, subfields):
+    """The value the game actually uses - the first subfield, or the scalar."""
+    try:
+        raw = getattr(obj, field)
+        return float(raw if not subfields else getattr(raw, subfields[0]))
+    except Exception:
+        return None
 
-    A struct read back from a property may be a copy, so it is assigned back
-    after being modified.
-    """
-    for attempt in (value, float(value), int(value)):
-        try:
-            if subfield is None:
-                setattr(obj, field, attempt)
-            else:
-                struct = getattr(obj, field)
-                setattr(struct, subfield, attempt)
-                setattr(obj, field, struct)
+
+def _read_member(obj, field, subfield):
+    try:
+        raw = getattr(obj, field)
+        return float(raw if subfield is None else getattr(raw, subfield))
+    except Exception:
+        return None
+
+
+def _apply_numbers(obj, field, subfields, values):
+    """Write one number to a plain property, or per-member values to a struct."""
+    try:
+        if not subfields:
+            setattr(obj, field, values[None])
             return True
-        except Exception as exc:
-            last = exc
-    where = field if subfield is None else f"{field}.{subfield}"
-    log(f"could not write {where} = {value!r}: {last}")
-    return False
+        struct = getattr(obj, field)
+        for name in subfields:
+            setattr(struct, name, values[name])
+        # A struct read from a property may be a copy, so assign it back.
+        setattr(obj, field, struct)
+        return True
+    except Exception as exc:
+        log(f"could not write {field}: {exc}")
+        return False
 
 
-def _resolve_field(behaviour: UObject, knob: str) -> tuple[str, str | None] | None:
+def _resolve_field(behaviour, knob):
     """The first candidate property for this knob that yields a number."""
     if knob in _resolved_fields:
         return _resolved_fields[knob]
 
     for candidate in FIELD_CANDIDATES[knob]:
-        found = _read_scalar(behaviour, candidate)
-        if found is None:
+        subfields = _probe_property(behaviour, candidate)
+        if subfields is None:
             continue
-        _, subfield = found
-        _resolved_fields[knob] = (candidate, subfield)
-        where = candidate if subfield is None else f"{candidate}.{subfield}"
-        log(f"'{knob}' resolved to '{where}'")
+        _resolved_fields[knob] = (candidate, subfields)
+        where = candidate + (f" ({', '.join(subfields)})" if subfields else "")
+        log(f"'{knob}' resolved to {where}")
         return _resolved_fields[knob]
 
     _resolved_fields[knob] = None
@@ -663,90 +689,113 @@ def _resolve_field(behaviour: UObject, knob: str) -> tuple[str, str | None] | No
             class_name = behaviour.Class.Name
         except Exception:
             class_name = "?"
-        names = _field_names(behaviour)
         log(
             f"no usable property for '{knob}' on {class_name}"
             f" (tried {', '.join(FIELD_CANDIDATES[knob])})"
         )
-        log(f"  {class_name} exposes: {', '.join(names) or 'nothing'}")
+        log(f"  {class_name} exposes: {', '.join(_field_names(behaviour)) or 'nothing'}")
     return None
 
 
-def _scale_field(behaviour: UObject, knob: str, scale: float) -> str | None:
-    """Multiply a value, re-basing if the game changed it under us."""
-    resolved = _resolve_field(behaviour, knob)
-    if resolved is None:
-        return None
-    field, subfield = resolved
-
-    found = _read_scalar(behaviour, field)
-    if found is None:
-        return None
-    current, _ = found
-
-    state = _touched.setdefault(behaviour._get_address(), {})
-    previous = state.get(field)
-    if previous is not None and abs(current - previous["applied"]) < 1e-4:
-        # Still holding our value, and the scale may have changed in the menu.
-        base = previous["original"]
-    else:
-        # First touch, or the game recalculated it - treat what is there as the
-        # new baseline so buffs and debuffs still come through.
-        base = current
-
-    wanted = base * scale
-    if not _write_scalar(behaviour, field, subfield, wanted):
-        return None
-
-    state[field] = {"original": base, "applied": wanted, "subfield": subfield}
+def _state_key(field, subfield):
     return field if subfield is None else f"{field}.{subfield}"
 
 
-def _set_field(behaviour: UObject, knob: str, value: float) -> str | None:
-    """Set a value outright."""
+def _members(subfields):
+    """Iterate struct members, or the single (None,) for a plain scalar."""
+    return subfields if subfields else (None,)
+
+
+def _scale_field(behaviour, knob, scale):
+    """Multiply every numeric member, re-basing if the game moved it."""
     resolved = _resolve_field(behaviour, knob)
     if resolved is None:
         return None
-    field, subfield = resolved
-
-    found = _read_scalar(behaviour, field)
-    if found is None:
-        return None
-    current, _ = found
-
-    if not _write_scalar(behaviour, field, subfield, value):
-        return None
+    field, subfields = resolved
 
     state = _touched.setdefault(behaviour._get_address(), {})
-    if field not in state:
-        state[field] = {"original": current, "applied": value, "subfield": subfield}
-    else:
-        state[field]["applied"] = value
-    return field if subfield is None else f"{field}.{subfield}"
+    targets = {}
+    bases = {}
+
+    for name in _members(subfields):
+        current = _read_member(behaviour, field, name)
+        if current is None:
+            return None
+        previous = state.get(_state_key(field, name))
+        if previous is not None and abs(current - previous["applied"]) < 1e-4:
+            # Still ours, and the scale may have changed in the menu.
+            base = previous["original"]
+        else:
+            # First touch, or the game recalculated it - rebase so buffs pass
+            # through.
+            base = current
+        bases[name] = base
+        targets[name] = base * scale
+
+    if not _apply_numbers(behaviour, field, subfields, targets):
+        return None
+
+    for name in _members(subfields):
+        state[_state_key(field, name)] = {
+            "original": bases[name],
+            "applied": targets[name],
+            "field": field,
+            "subfield": name,
+        }
+    return _state_key(field, subfields[0] if subfields else None)
 
 
-def _verify(behaviour: UObject, knob: str) -> tuple[float, float] | None:
-    """Read a knob back after writing. Returns (expected, actual)."""
+def _set_field(behaviour, knob, value):
+    """Set every numeric member outright."""
+    resolved = _resolve_field(behaviour, knob)
+    if resolved is None:
+        return None
+    field, subfields = resolved
+
+    state = _touched.setdefault(behaviour._get_address(), {})
+    originals = {}
+    for name in _members(subfields):
+        current = _read_member(behaviour, field, name)
+        if current is None:
+            return None
+        originals[name] = current
+
+    targets = {name: float(value) for name in _members(subfields)}
+    if not _apply_numbers(behaviour, field, subfields, targets):
+        return None
+
+    for name in _members(subfields):
+        key = _state_key(field, name)
+        if key not in state:
+            state[key] = {
+                "original": originals[name],
+                "applied": float(value),
+                "field": field,
+                "subfield": name,
+            }
+        else:
+            state[key]["applied"] = float(value)
+    return _state_key(field, subfields[0] if subfields else None)
+
+
+def _verify(behaviour, knob):
+    """Read a knob's effective value back after writing."""
     resolved = _resolved_fields.get(knob)
     if not resolved:
         return None
-    field, _ = resolved
-    state = _touched.get(behaviour._get_address(), {}).get(field)
-    if state is None:
+    field, subfields = resolved
+    key = _state_key(field, subfields[0] if subfields else None)
+    record = _touched.get(behaviour._get_address(), {}).get(key)
+    if record is None:
         return None
-    found = _read_scalar(behaviour, field)
-    if found is None:
+    actual = _read_effective(behaviour, field, subfields)
+    if actual is None:
         return None
-    return float(state["applied"]), found[0]
+    return float(record["applied"]), actual
 
 
-def check_drift(behaviour: UObject) -> list[str]:
-    """Which knobs no longer hold the value we wrote?
-
-    Distinguishes the two ways this can fail silently: the write not sticking
-    (the game re-resolves the value from its data-table source) versus the
-    write sticking but the game reading the number from somewhere else.
-    """
+def check_drift(behaviour):
+    """Which knobs no longer hold the effective value we wrote?"""
     drifted = []
     for knob in FIELD_CANDIDATES:
         pair = _verify(behaviour, knob)
@@ -795,8 +844,16 @@ def restore_all() -> None:
         state = _touched.get(behaviour._get_address())
         if not state:
             continue
-        for field, record in state.items():
-            _write_scalar(behaviour, field, record.get("subfield"), record["original"])
+        # Records are keyed per struct member, so group them back per
+        # property and restore every member in one write.
+        by_property: dict[str, dict[str | None, float]] = {}
+        for record in state.values():
+            by_property.setdefault(record["field"], {})[record["subfield"]] = record[
+                "original"
+            ]
+        for field, originals in by_property.items():
+            subfields = tuple(n for n in originals if n is not None)
+            _apply_numbers(behaviour, field, subfields, originals)
         restored += 1
     _touched.clear()
     _weapon_cache.clear()
@@ -1091,8 +1148,9 @@ def masher_command(args: Any) -> None:
             if resolved is None:
                 log(f"  {knob:<12} -> NO USABLE PROPERTY")
             else:
-                field, subfield = resolved
-                log(f"  {knob:<12} -> {field}{'.' + subfield if subfield else ''}")
+                field, subfields = resolved
+                where = field + (f" ({', '.join(subfields)})" if subfields else "")
+                log(f"  {knob:<12} -> {where}")
         log("hook activity:")
         for hook_obj in HOOKS:
             for func_name, _hook_type in hook_obj.hook_funcs:

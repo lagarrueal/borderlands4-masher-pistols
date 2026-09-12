@@ -237,6 +237,35 @@ why one line of log took a whole session to explain.
 `behaviours modified: 2` was reported while nothing had been modified. It now
 records only successful writes.
 
+### `BaseValue` is not the value — `Value` is
+
+Five test sessions died on this. `masher probe` settled it in one:
+
+```
+modified Jakobs pistol        untouched Torgue shotgun
+  ProjectilesPerShot            ProjectilesPerShot
+    BaseValue = 6  <- we wrote    BaseValue = 3
+    Value     = 1  <- game reads  Value     = 3   <- equal when untouched
+```
+
+The struct exposes `Value` **and** `BaseValue`. On an untouched weapon they
+agree, so nothing in the data hints that they differ — you only see it after
+writing one of them. `drift: none` was correct and useless: the write held
+perfectly, the game simply reads the other member.
+
+`GbxAttributeBase`'s reflected members are `OldValue` and `BaseValue`, which is
+why `BaseValue` looked authoritative in the binary. `Value` lives on the
+derived type and does not appear in that block. **The binary's property table
+is not a reliable guide to which member matters.**
+
+Both members are now written. They are *scaled*, not assigned, wherever a ratio
+exists — `Damage` runs `BaseValue 82 / Value 241`, a roughly 2.9x modifier
+chain (manufacturer scaling, level, skills), and flattening the two to one
+number would destroy it.
+
+The general lesson, now paid for three times over: **a property is not a
+number, and a number is not the number.** Probe the live object before writing.
+
 ### The item card follows for free
 
 `Nexus-Data-ui_stat0.ncs` defines two damage rows whose `displaycondition` is a
@@ -361,17 +390,8 @@ sessions now:
 
 **Still open:**
 
-- **Whether writing `BaseValue` takes effect.** Writes now succeed and are
-  reported as applied, but the fifth in-game run produced no visible change.
-  A `setattr` that does not raise is not proof the value took, and treating it
-  as proof cost a session. Both failure modes are now instrumented:
-  `check_drift()` reads every knob back after writing and again on the next
-  pass, so the log distinguishes
-  *the write was rejected* from *the write held and the game reads elsewhere*.
-  `masher probe` dumps every field of every attribute struct on the carried
-  guns, which is what will name the real target - `GbxAttributeBase` reflects
-  only `OldValue` and `BaseValue`, so if an effective/current value exists it
-  lives on the derived type or is recomputed from modifiers.
+- ~~Whether writing `BaseValue` takes effect.~~ **Settled — it does not.** The
+  struct carries two numbers and `Value` is the one the game reads. See below.
 - ~~Whether the item card reflects any of it.~~ **Settled — it does.** See
   below.
 - `PlayEffects` has only been observed firing for `OakVehicleWeapon` turrets, so
