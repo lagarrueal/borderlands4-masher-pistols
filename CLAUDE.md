@@ -361,12 +361,17 @@ sessions now:
 
 **Still open:**
 
-- **Whether writing `BaseValue` takes effect.** The struct is reachable and
-  writable; whether the game re-resolves the value from its `datatablevalue`
-  afterwards is not yet known. If it does, the write must move to the Def or to
-  an attribute modifier.
-- **Whether `Damage`'s struct is the per-projectile damage** or something the
-  attribute pipeline overwrites each frame.
+- **Whether writing `BaseValue` takes effect.** Writes now succeed and are
+  reported as applied, but the fifth in-game run produced no visible change.
+  A `setattr` that does not raise is not proof the value took, and treating it
+  as proof cost a session. Both failure modes are now instrumented:
+  `check_drift()` reads every knob back after writing and again on the next
+  pass, so the log distinguishes
+  *the write was rejected* from *the write held and the game reads elsewhere*.
+  `masher probe` dumps every field of every attribute struct on the carried
+  guns, which is what will name the real target - `GbxAttributeBase` reflects
+  only `OldValue` and `BaseValue`, so if an effective/current value exists it
+  lives on the derived type or is recomputed from modifiers.
 - ~~Whether the item card reflects any of it.~~ **Settled — it does.** See
   below.
 - `PlayEffects` has only been observed firing for `OakVehicleWeapon` turrets, so

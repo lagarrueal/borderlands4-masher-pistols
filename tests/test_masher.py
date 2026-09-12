@@ -79,6 +79,7 @@ def reset_mod() -> None:
     jm._resolved_fields.clear()
     jm._missing_reported.clear()
     jm._shape_reported.clear()
+    jm._drift_reported.clear()
     env.reset_world()
 
 
@@ -488,6 +489,54 @@ check(
     str(jm._shape_reported),
 )
 
+# A write that reports success but does not survive must be caught. This is the
+# difference between "the mod applied it" and "the game kept it".
+reset_mod()
+jm.masher_frequency.value = 4
+dw, db = make_struct_weapon()
+jm.make_masher(db)
+check("no drift right after writing", jm.check_drift(db) == [], str(jm.check_drift(db)))
+
+# Simulate the engine re-resolving the value from its data-table source.
+db.ProjectilesPerShot.BaseValue = 1
+drift = jm.check_drift(db)
+check(
+    "a reverted value is detected",
+    any("projectiles" in d for d in drift),
+    str(drift),
+)
+
+# A write that silently does nothing is caught too.
+reset_mod()
+jm.masher_frequency.value = 4
+sticky_w = env.FakeObject(
+    "OakWeapon", path="World.Sticky", BodyData="Body_JAK_PS"
+)
+
+
+class StubbornStruct(env.WrappedStruct):
+    """Accepts writes and discards them, like a value the engine recomputes."""
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        # swallow it
+
+
+stubborn = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Sticky.Fire",
+    outer=sticky_w,
+    ProjectilesPerShot=StubbornStruct(BaseValue=1),
+)
+jm.make_masher(stubborn)
+check(
+    "a write that does not take is reported",
+    any("projectiles" in d for d in jm.check_drift(stubborn)),
+    str(jm.check_drift(stubborn)),
+)
+
 # End to end through the sweep, with the realistic shape.
 reset_mod()
 jm.masher_frequency.value = 4
@@ -674,7 +723,7 @@ check("scan keybind registered", len(kbs) == 1 and kbs[0].name == "Scan Weapons 
 
 cmds = env.sys.modules["mods_base"].REGISTERED["commands"]
 check("masher command registered", len(cmds) == 1 and cmds[0].cmd == "masher")
-for action in ("dump", "status", "scan", "mine", "restore"):
+for action in ("dump", "status", "scan", "mine", "probe", "restore"):
     try:
         cmds[0](action)
         check(f"'masher {action}' runs", True)

@@ -562,6 +562,7 @@ _resolved_fields: dict[str, tuple[str, str | None] | None] = {}
 # Knobs and struct shapes we have already complained about.
 _missing_reported: set[str] = set()
 _shape_reported: set[str] = set()
+_drift_reported: set[int] = set()
 
 
 def _field_names(obj: Any) -> list[str]:
@@ -724,10 +725,53 @@ def _set_field(behaviour: UObject, knob: str, value: float) -> str | None:
     return field if subfield is None else f"{field}.{subfield}"
 
 
-def make_masher(behaviour: UObject) -> list[str]:
-    """Turn one fire behaviour into a Masher. Returns what actually stuck."""
-    applied: list[str] = []
+def _verify(behaviour: UObject, knob: str) -> tuple[float, float] | None:
+    """Read a knob back after writing. Returns (expected, actual)."""
+    resolved = _resolved_fields.get(knob)
+    if not resolved:
+        return None
+    field, _ = resolved
+    state = _touched.get(behaviour._get_address(), {}).get(field)
+    if state is None:
+        return None
+    found = _read_scalar(behaviour, field)
+    if found is None:
+        return None
+    return float(state["applied"]), found[0]
 
+
+def check_drift(behaviour: UObject) -> list[str]:
+    """Which knobs no longer hold the value we wrote?
+
+    Distinguishes the two ways this can fail silently: the write not sticking
+    (the game re-resolves the value from its data-table source) versus the
+    write sticking but the game reading the number from somewhere else.
+    """
+    drifted = []
+    for knob in FIELD_CANDIDATES:
+        pair = _verify(behaviour, knob)
+        if pair is None:
+            continue
+        expected, actual = pair
+        if abs(expected - actual) > 1e-3:
+            drifted.append(f"{knob} expected {expected:g} but reads {actual:g}")
+    return drifted
+
+
+def make_masher(behaviour: UObject) -> list[str]:
+    """Turn one fire behaviour into a Masher. Returns what actually stuck.
+
+    Every write is read back: a setattr that does not raise is not proof the
+    value took, and assuming it was cost a test session.
+    """
+    # Before writing, notice if what we wrote last time has since been undone.
+    reverted = check_drift(behaviour)
+    if reverted and behaviour._get_address() not in _drift_reported:
+        _drift_reported.add(behaviour._get_address())
+        log(f"value(s) did not persist since the last pass: {'; '.join(reverted)}")
+        log("  the game is re-resolving these - writing BaseValue is not enough")
+
+    applied: list[str] = []
     for field in (
         _set_field(behaviour, "projectiles", int(projectiles.value)),
         _scale_field(behaviour, "damage", float(damage_scale.value)),
@@ -735,6 +779,11 @@ def make_masher(behaviour: UObject) -> list[str]:
     ):
         if field is not None:
             applied.append(field)
+
+    # And confirm the writes we just made actually read back.
+    rejected = check_drift(behaviour)
+    if rejected:
+        log(f"write did not take: {'; '.join(rejected)}")
 
     return applied
 
@@ -755,6 +804,7 @@ def restore_all() -> None:
     _resolved_fields.clear()
     _missing_reported.clear()
     _shape_reported.clear()
+    _drift_reported.clear()
     if restored:
         log(f"restored {restored} weapon(s)")
 
@@ -1103,6 +1153,64 @@ def masher_command(args: Any) -> None:
             )
         return
 
+    if args.action == "probe":
+        # Everything about the guns you are carrying, in full: the behaviour's
+        # fields, and every field of every attribute struct with its value.
+        # This is what answers "the write says it worked but nothing changed".
+        mine = [
+            (weapon, behaviours)
+            for weapon, behaviours in live_weapons().values()
+            if is_player_weapon(weapon) is not False
+        ]
+        log(f"probing {len(mine)} carried weapon(s)")
+
+        for weapon, behaviours in mine:
+            tags = sorted(
+                {
+                    match.group(0).upper()
+                    for text in collect_identity(weapon)
+                    for match in WEAPON_TAG_RE.finditer(text)
+                }
+            )
+            cached = _weapon_cache.get(weapon._get_address())
+            log(
+                f"--- {'/'.join(tags) or 'untagged'}"
+                f" jakobs_pistol={is_jakobs_pistol(weapon)}"
+                f" masher={cached[2] if cached else None}"
+            )
+
+            for behaviour in behaviours:
+                try:
+                    log(f"    behaviour {behaviour.Class.Name}")
+                except Exception:
+                    log("    behaviour <unnamed>")
+                log(f"      fields: {', '.join(_field_names(behaviour))}")
+
+                for candidate in (
+                    "ProjectilesPerShot",
+                    "Damage",
+                    "Spread",
+                    "FireRate",
+                ):
+                    try:
+                        raw = getattr(behaviour, candidate)
+                    except Exception as exc:
+                        log(f"      {candidate}: unreadable ({exc})")
+                        continue
+                    if _is_number(raw):
+                        log(f"      {candidate} = {raw} (plain number)")
+                        continue
+                    log(f"      {candidate} = struct:")
+                    for name in _field_names(raw):
+                        try:
+                            log(f"          {name} = {_describe(getattr(raw, name))[:120]}")
+                        except Exception as exc:
+                            log(f"          {name} = <unreadable: {exc}>")
+
+                drift = check_drift(behaviour)
+                log(f"      drift: {'; '.join(drift) if drift else 'none - values held'}")
+        return
+
     if args.action == "restore":
         restore_all()
         return
@@ -1187,11 +1295,11 @@ masher_command.add_argument(
     "action",
     nargs="?",
     default="dump",
-    choices=("dump", "status", "scan", "mine", "restore"),
+    choices=("dump", "status", "scan", "mine", "probe", "restore"),
     help=(
         "dump the live weapon data, show mod status and hook activity,"
         " scan every loaded weapon now, list the guns you are carrying,"
-        " or undo all changes"
+        " probe them in full, or undo all changes"
     ),
 )
 

@@ -111,6 +111,7 @@ masher dump      # print the live fire behaviours, their properties and owners
 masher status    # what the mod found: hooks, ownership link, resolved properties
 masher scan      # apply to every loaded weapon now, ignoring hooks
 masher mine      # list the guns you are carrying, and which are Mashers
+masher probe     # full dump of those guns: every struct field and its value
 masher restore   # undo every change without disabling the mod
 ```
 
@@ -143,7 +144,7 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-91 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+95 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.
