@@ -82,36 +82,38 @@ Hence the runtime approach.
 
 ### Why not a `.pak` mod, like `bl4-xp-mod`?
 
-Worth re-asking, since that is the house style in this repo. The XP mod works by
-**repointing an existing cell** to a different pooled string — it never adds
-anything. That technique needs the cell to already exist.
+The right question, and it took three attempts to answer correctly. NCS
+**writing exists** — `scripts/ncs_multipatch.py` appends strings to the
+`value_strings` pool and rewrites a cell's bit-packed index, which is exactly
+how the XP mod works. Saying this "needs an NCS re-encoder first" was wrong.
 
-Counted over the expanded `inv4` JSON (`bl4 ncs show --json`, which unlike the
-text output does expand child part records):
+The actual limit is narrower: repointing rewrites the value of a cell that
+**already exists**. It cannot add a key to a record, because that changes
+`key_strings`, the type-code matrix, and the bit offset of every later cell.
 
-```
-63 records set projectilespershot
- 0 of them are JAK
-```
+So the question becomes: does a Jakobs pistol have a `projectilespershot` cell
+anywhere in its resolution chain? Checked at all three levels, and the answer
+is no at each:
 
-Every one is a shotgun, a launcher, or an underbarrel — `VLA_Shotgun`
-(`constant: 6.000000`), `BOR_Atlas`, `DAD_Microrocket`, and so on. **No Jakobs
-pistol record carries the key at all**, so there is no cell to repoint. Giving
-one to `jak_ps` means adding a new key to a record, which is exactly the
-re-encoder wall.
+| Level | Finding |
+|---|---|
+| **Part** | `jak_ps` has only 3 parts with a fire aspect — `part_barrel_01_phantom_flame`, `part_barrel_02_kingsgambit`, `part_barrel_quickdraw`. The common barrels (`part_barrel_01`, `part_barrel_02`) have **no fire aspect at all**; they inherit wholesale. |
+| **Aspect** | `jak_ps_fire_projectile` sets exactly one key: `recoil`. Its parent `ps_fire_projectile` has 15 keys, none of them `projectilespershot`. **No base fire aspect in the game has it** — it is always set per part. |
+| **Data table** | `part_barrel_quickdraw` *does* reference `Unique_PS_Barrel_Init` → `ProjectilesPerShot_Value`, but the `JAK_Quickdraw` row has no such cell (rows store only the fields they set, the way `TOR_Linebacker` in `unique_sg_barrel_init` carries `projectilespershot_value: 4.000000`). Nothing to repoint. |
 
-Adjacent ideas, and why they fail:
+Counting properly — `175` part records set `projectilespershot`, `30` of them
+JAK, `6` on `jak_ps`. But those six are five underbarrels (a separate fire mode,
+not the revolver's own shot) plus QuickDraw, whose cell is absent from the row
+it points at.
 
-- *Repoint `attributetomodify` on an existing `jak_ps` aspect to
-  `weapon_projectile_per_shot`.* The only candidates are the Jakobs damage
-  multiplier and the ricochet params, so it would trade the Masher for broken
-  Jakobs damage or ricochet — and the paired `modifiervalue` is a data-table
-  reference, not a constant, so the number would be wrong anyway.
-- *Patch the `Weapon_SG_Barrel_Init` data table.* Pistols never reference it.
+> An earlier pass here reported "63 records, 0 JAK". That was wrong: the script
+> labelled each hit by its JSON path, which never contained the part name, so
+> the JAK filter matched nothing. The conclusion happened to survive; the
+> evidence for it did not.
 
-So the SDK route is not a shortcut here; it is the only route. The trade is
-real, though, and worth stating: a pak mod would persist without Python and
-survive in a vanilla install, where this one needs the SDK and is host-only.
+So the SDK route is not a shortcut, it is the only route — but the trade is
+real: a pak mod would persist without Python and work on a vanilla install,
+where this one needs the SDK and is host-only.
 
 ## Two offline reflection tricks
 
