@@ -661,8 +661,10 @@ decrypted `11.sav` (Loveless, `Char_CorpoHacker`) before and after:
   mods. Those were only hidden in game and came back once the pak was
   removed.
 
-**Cause (found after the null-pak control reproduced it): the build read a
-stale inv4.** repak panics on `pakchunk4-Windows_20_P.pak`, so the build took
+**Partial cause: the build read a stale inv4.** This was real, but it is
+not the whole story. A pak rebuilt from W20 still hid Throwaway Amon's
+Paladin and Dark Siren class mods (types 255 and 254), which both copies
+define. Still open, see the next section. repak panics on `pakchunk4-Windows_20_P.pak`, so the build took
 Windows_18 as newest. `classmod_corpohacker`, the class mods of the newest
 class (serial type 402), exists only in W20's inv4. The mod pak shadowed W20,
 so those items could not resolve. Even the unchanged repack deleted them.
@@ -686,3 +688,22 @@ and `..._after_masher_pak_test`.
 null pak (inv4 repacked unchanged), on a throwaway character, with the save
 restored afterwards. If it also deletes items, overriding inv4 is unsafe as
 such; if not, the key rename is at fault.
+
+### Still open after the W20 rebuild (2026-09-29)
+
+W20 is the newest inv4: carving W21 and W22 finds no `inv` table. The
+W20-based pak still showed `dmg x 6` on a Muki and still hid Amon's class
+mods, though nothing was deleted on disk. Every game NCS uses header flag 3,
+the XP mod's originals included, so the flag is not what differs.
+
+Working hypothesis: the game stops reading the mod's **stored** (uncompressed,
+1.8 MB) file partway. What broke is all defined past record 0:
+- class-mod records (1-3);
+- legendary comps (records 1-2), which fits Lost Loot being mostly legendaries.
+
+Common gear in record 0 survived. The discriminating control is `--original`:
+W20's compressed file, byte for byte, in the mod pak.
+
+The full auto seen in testing ("double shots") came from renaming away
+`automaticburstcount: 1`, which is what keeps a Jakobs pistol semi-auto.
+Rename `bautoburst` (`false`, already the default) instead.
