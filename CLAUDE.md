@@ -644,3 +644,35 @@ Planned next, once the card is confirmed:
 A Masher is then whatever rolls barrel 02, so the frequency is fixed by the
 game's barrel roll. It applies to guns already owned and is stored in the
 serial. The SDK mod was disabled for the test so the two do not stack.
+
+### Test result: the card works, and the pak destroys items (2026-09-29)
+
+In game, a "Panicking Muki" card read **`227 x 6`**, the Cuca was unchanged,
+and the gun fired multiple projectiles, with an occasional double shot.
+Probably `AutomaticBurstCount` fell to the engine default once the field was
+renamed away; no parent aspect defines it.
+
+**But with the pak installed, the character lost items.** Comparing the
+decrypted `11.sav` (Loveless, `Char_CorpoHacker`) before and after:
+- the **equipped class mod** (`slot_8`, item type 402) was deleted;
+- **26 of 40 Lost Loot items** were deleted, of every kind (guns, shields,
+  Gravitar and Dark Siren class mods), with no Lost Loot interaction;
+- the **backpack was byte-identical**, 65 serials including 12 type-402 class
+  mods. Those were only hidden in game and came back once the pak was
+  removed.
+
+Cause unknown. Type 402 has no top-level definition in inv0, inv4 or inv6. It
+appears in inv4 only as a nested `_scope: Sub` serialindex inside every class
+mod's `passive_points` entries. The decode check proved the file differs by
+one field *as bl4.exe reads it*. The game evidently reads it differently, or
+rejects the modified file for some content. The XP mod replaces attribute0
+and data_table0 the same way with no such effect, so the difference is
+specific to inv4 or to the edit.
+
+Backups: `SaveGames/CLAUDE_BACKUP_20260929_before_masher_pak` (pre-install)
+and `..._after_masher_pak_test`.
+
+**Do not reinstall until the cause is known.** Next discriminating test: a
+null pak (inv4 repacked unchanged), on a throwaway character, with the save
+restored afterwards. If it also deletes items, overriding inv4 is unsafe as
+such; if not, the key rename is at fault.
