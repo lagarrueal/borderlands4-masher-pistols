@@ -11,3 +11,4 @@ __pycache__/
 *.ucas
 *.utoc
 _trace_*.txt
+build/

@@ -612,3 +612,35 @@ sessions now:
   below.
 - `PlayEffects` has only been observed firing for `OakVehicleWeapon` turrets, so
   it is still not confirmed to fire for player guns. The keybind covers this.
+
+## Pak route, revisited (2026-09-29, in test)
+
+The SDK route cannot reach the item card (see above), so the data route was
+re-examined, and an earlier claim here turned out wrong. **Every common JAK_PS
+barrel does carry an inline fire aspect** (`parent:
+inv_aspect'jak_ps_fire_projectile'`) with spread, damage, fire rate and
+`automaticburstcount: "1"`. Only `projectilespershot` is missing.
+
+The NCS writer cannot add a field, but it can **rename** one. Struct field
+names are indices into the payload's `key_strings` pool (inv4: 3785 keys at 12
+bits; `automaticburstcount`=582, `projectilespershot`=302). The instrumented
+trace logs values, not keys, but a field's key sits in the gap before its
+traced value: 9 bits in, 12 wide, then 4 type bits. That was checked on
+`automaticburstcount`, `bautoburst` and `firefeedback`.
+
+`pak/build_masher_pak.py` makes barrel 02 (name part `Muki`) the Masher
+barrel. It renames that field, repoints its value `1` to `6.000000`, decodes
+the result, and requires it to equal the original except for that one field.
+Output: `JakobsMasher_9600_P.pak/.ucas/.utoc`. No other installed mod ships
+inv4.
+
+Planned next, once the card is confirmed:
+- `gbx_ue_data_table4` row `JAK_Barrel_02`: `damage_scale` 3.4 -> 1.36 (x0.4)
+  and `spread_value` 1.05 -> 3.15 (x3).
+- `inv_name_part4` `np_weap_JAK_PS_B02`: partname
+  `"WeaponNamingStrategies, 4A32D085..., Muki"` -> a new string ending
+  `Masher`.
+
+A Masher is then whatever rolls barrel 02, so the frequency is fixed by the
+game's barrel roll. It applies to guns already owned and is stored in the
+serial. The SDK mod was disabled for the test so the two do not stack.
