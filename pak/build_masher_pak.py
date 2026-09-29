@@ -33,6 +33,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -68,6 +69,27 @@ MASHER_KEY = "projectilespershot"
 PROJECTILES = "6.000000"                  # BL3's Masher barrel fired 6
 # The barrel's damage attribute, which the trace uses to find the barrel.
 BARREL_DAMAGE_VALUE = "jak_ps_barrel_02_damage"
+
+# Per-projectile damage and spread, from the barrel's data-table row. Only
+# jak_ps part_barrel_02 reads Weapon_PS_Barrel_Init / JAK_Barrel_02 (rows of
+# the same name in the AR/SG/SR tables belong to other tables), so scaling
+# the row changes Mashers and nothing else. Scaled from whatever the current
+# game data holds: the values moved between patches (damage 3.4 -> 4.2).
+TABLE_FILE = "Nexus-Data-gbx_ue_data_table4.ncs"
+TABLE_ENTRY = "weapon_ps_barrel_init"
+TABLE_ROW = "JAK_Barrel_02"
+TABLE_SCALES = {"damage_scale": 0.40, "spread_value": 3.0}  # 6 x 0.4 = 2.4x, as in BL3
+
+# The barrel's name part: "... Muki" becomes "... Masher". The partname is a
+# localized-text reference "<namespace>, <key>, <source text>"; a key the
+# localization tables do not know should fall back to the source text. Only
+# part_barrel_02 references this name part.
+NAME_FILE = "Nexus-Data-inv_name_part4.ncs"
+NAME_ENTRY = "np_weap_jak_ps_b02"
+NAME_KEY = "partname"
+MASHER_NAME = "Masher"
+# A stable key, so every rebuild writes the same string.
+MASHER_NAME_KEY = uuid.uuid5(uuid.NAMESPACE_URL, "bl4-masher/np_weap_JAK_PS_B02").hex.upper()
 # -----------------------------------------------------------------------------
 
 VALUE_RE = re.compile(r'VALUE bitpos=(\d+) bits=(\d+) raw=(\d+) idx=(\d+) val="(.*)"')
@@ -278,6 +300,132 @@ def verify(original: dict, patched: dict) -> None:
     print(f"  verified: {MASHER_BARREL} now has {MASHER_KEY}={PROJECTILES}; nothing else in the file changed")
 
 
+# --- the data table and the name part --------------------------------------
+
+ENTRY_RE = re.compile(r'ENTRY key="([^"]*)"')
+
+
+def find_field(payload: bytes, lines: list[str], entry: str, key: str, expected: str,
+               after: str | None = None, window: int = 24) -> dict:
+    """The value cell of `key` inside trace entry `entry`, asserted to hold `expected`.
+
+    If `after` is given, only values after the first occurrence of that value
+    inside the entry are considered (e.g. a row name). A candidate counts only
+    if its gap holds the key's 12-bit index exactly once, so a value that is
+    merely equal to `expected` elsewhere is never picked.
+    """
+    blocks, data_start = string_blocks(payload)
+    keys = blocks["key_strings"]
+    key_index = keys["strings"].index(key)
+    starts = [i for i, line in enumerate(lines) if (m := ENTRY_RE.match(line)) and m.group(1) == entry]
+    if len(starts) != 1:
+        raise SystemExit(f"expected 1 trace entry '{entry}', found {len(starts)}")
+    region = []
+    for line in lines[starts[0] + 1 :]:
+        if line.startswith("ENTRY "):
+            break
+        m = VALUE_RE.match(line)
+        if m:
+            region.append(m)
+    if after is not None:
+        first = next((k for k, m in enumerate(region) if m.group(5) == after), None)
+        if first is None:
+            raise SystemExit(f"'{after}' not found in entry '{entry}'")
+        region = region[first : first + window + 1]
+    data_bit = data_start * 8
+    hits = []
+    for k in range(1, len(region)):
+        m = region[k]
+        value_pos = int(m.group(1))
+        gap_start = int(region[k - 1].group(1)) + int(region[k - 1].group(2))
+        in_gap = [
+            b for b in range(gap_start, value_pos - keys["bits"] + 1)
+            if read_bits(payload, data_bit + b, keys["bits"]) == key_index
+        ]
+        if len(in_gap) == 1:
+            hits.append((value_pos, m.group(5)))
+    if not hits:
+        raise SystemExit(f"no '{key}' cell in '{entry}'")
+    if after is None and len(hits) != 1:
+        raise SystemExit(f"expected 1 '{key}' cell in '{entry}', found {hits}")
+    # After a row name, the row's own fields come first; the next row's
+    # fields of the same name follow. The value check below guards the pick.
+    value_pos, value = hits[0]
+    if value != expected:
+        raise SystemExit(f"'{entry}.{key}' holds {value!r}, expected {expected!r}")
+    return {"bitpos": value_pos, "value": value}
+
+
+def repoint(payload: Path, edits: list[dict], tag: str) -> Path:
+    """Apply value repoints with the shared tool; returns the patched payload."""
+    edits_file = BUILD / f"_edits_{tag}.json"
+    edits_file.write_text(json.dumps(edits), encoding="utf-8")
+    out_bin = BUILD / f"_{tag}_patched.bin"
+    out = run([sys.executable, SCRIPTS / "ncs_multipatch.py", payload, out_bin, edits_file])
+    print("  " + out.stdout.strip().replace("\n", "\n  "))
+    if "verify=OK" not in out.stdout:
+        raise SystemExit(f"repoint failed for {tag}:\n{out.stdout}\n{out.stderr}")
+    return out_bin
+
+
+def table_row(doc: dict) -> dict:
+    for record in doc["tables"]["gbx_ue_data_table"]["records"]:
+        for entry in record["entries"]:
+            if entry["key"].lower() == TABLE_ENTRY:
+                for row in entry["value"]["data"]:
+                    if row["row_name"] == TABLE_ROW:
+                        return row["row_value"]
+    raise SystemExit(f"{TABLE_ENTRY}/{TABLE_ROW} not found")
+
+
+def name_part(doc: dict) -> dict:
+    for table in doc["tables"].values():
+        for record in table["records"]:
+            for entry in record["entries"]:
+                if entry["key"].lower() == NAME_ENTRY:
+                    return entry["value"]
+    raise SystemExit(f"{NAME_ENTRY} not found")
+
+
+def build_table(root: Path) -> None:
+    payload = extract_payload(TABLE_FILE, "dt4")
+    original = decode_json(payload)
+    row = table_row(original)
+    lines = trace(payload, "dt4")
+    edits, expected = [], {}
+    for key, scale in TABLE_SCALES.items():
+        old = row[key]
+        new = f"{float(old) * scale:.6f}"
+        cell = find_field(payload.read_bytes(), lines, TABLE_ENTRY, key, old, after=TABLE_ROW)
+        edits.append({"bitpos": cell["bitpos"], "target": new})
+        expected[key] = new
+        print(f"  {TABLE_ROW}.{key}: {old} -> {new} (x{scale})")
+    patched = repoint(payload, edits, "dt4")
+    want = copy.deepcopy(original)
+    table_row(want).update(expected)
+    if decode_json(patched) != want:
+        raise SystemExit("the data table changed beyond the intended row cells")
+    print(f"  verified: only {TABLE_ROW}'s {', '.join(TABLE_SCALES)} changed")
+    store(patched, root / "Engine" / "Content" / "_NCS" / TABLE_FILE)
+
+
+def build_name(root: Path) -> None:
+    payload = extract_payload(NAME_FILE, "np4")
+    original = decode_json(payload)
+    old = name_part(original)[NAME_KEY]
+    namespace = old.split(",", 1)[0]
+    new = f"{namespace}, {MASHER_NAME_KEY}, {MASHER_NAME}"
+    cell = find_field(payload.read_bytes(), trace(payload, "np4"), NAME_ENTRY, NAME_KEY, old)
+    print(f"  {NAME_ENTRY}.{NAME_KEY}: {old!r} -> {new!r}")
+    patched = repoint(payload, [{"bitpos": cell["bitpos"], "target": new}], "np4")
+    want = copy.deepcopy(original)
+    name_part(want)[NAME_KEY] = new
+    if decode_json(patched) != want:
+        raise SystemExit("the name parts changed beyond the Masher name")
+    print(f"  verified: only {NAME_ENTRY}'s name changed")
+    store(patched, root / "Engine" / "Content" / "_NCS" / NAME_FILE)
+
+
 # --- packaging -------------------------------------------------------------
 
 
@@ -336,7 +484,16 @@ def build() -> None:
 
     # 3. Decode both and require the change to be exactly the one intended.
     verify(decode_json(payload), decode_json(patched))
-    package(patched)
+    root = BUILD / "_modroot"
+    shutil.rmtree(root, ignore_errors=True)
+    store(patched, ncs_destination(root))
+
+    if "--projectiles-only" not in sys.argv:
+        print()
+        build_table(root)
+        print()
+        build_name(root)
+    pack_root(root)
 
 
 # Where the file goes in the pak.
