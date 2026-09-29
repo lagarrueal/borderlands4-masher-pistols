@@ -74,37 +74,53 @@ def run(cmd, **kw):
     return result
 
 
-def newest_game_pak_with(filename: str) -> Path:
-    """Highest-numbered *game* pak holding `filename`; mod paks are excluded."""
-    best, best_n = None, -1
-    for pak in sorted(PAKS.glob("pakchunk*.pak")):
-        listing = run([REPAK, "list", pak]).stdout
-        if filename not in listing:
+def pak_version(pak: Path) -> int:
+    match = re.search(r"_(\d+)_P\.pak$", pak.name)
+    return int(match.group(1)) if match else 0
+
+
+def newest_copy(filename: str) -> tuple[Path, Path]:
+    """(pak, carved file) for the highest-numbered game pak holding `filename`.
+
+    Deliberately does not use `repak list`: repak panics on 60 of the game's
+    paks, including pakchunk4-Windows_20, which holds the newest inv4. A build
+    from the newest pak repak *could* read (Windows_18) shadowed the real
+    inv4 - the class mods of the newest class (`classmod_corpohacker`, type
+    402) exist only in Windows_20 - and the game hid those items and deleted
+    the equipped one and most of Lost Loot.
+
+    The file name is always present as plain text in a pak's index, readable
+    or not, so candidates are found by grepping the raw bytes, then carved out
+    by content (scripts/carve_ncs.py).
+    """
+    sys.path.insert(0, str(SCRIPTS))
+    from carve_ncs import carve  # noqa: E402
+
+    chunk = re.search(r"(\d+)\.ncs$", filename).group(1)
+    stem = filename[len("Nexus-Data-") : -len(".ncs")]  # e.g. "inv4"
+    needle = filename.encode()
+    candidates = sorted(PAKS.glob(f"pakchunk{chunk}-Windows_*_P.pak"), key=pak_version, reverse=True)
+    for pak in candidates:
+        if needle not in pak.read_bytes():
             continue
-        match = re.search(r"_(\d+)_P\.pak$", pak.name)
-        n = int(match.group(1)) if match else 0
-        if n >= best_n:
-            best, best_n = pak, n
-    if best is None:
-        raise SystemExit(f"no game pak contains {filename}")
-    return best
+        out = BUILD / f"_carved_{pak.stem}"
+        shutil.rmtree(out, ignore_errors=True)
+        for _table, _size, target in carve(pak, out):
+            if target.name == f"{stem}.ncs":
+                return pak, target
+        raise SystemExit(f"{pak.name} lists {filename} but no matching NCS could be carved from it")
+    raise SystemExit(f"no game pak contains {filename}")
 
 
 def extract_payload(filename: str, tag: str) -> Path:
-    """Unpack the newest copy and decompress it to a raw payload."""
-    pak = newest_game_pak_with(filename)
+    """Carve the newest copy out of the game paks and decompress it."""
+    pak, carved = newest_copy(filename)
     print(f"  {filename}: newest copy in {pak.name}")
     raw, dec = BUILD / f"_{tag}_raw", BUILD / f"_{tag}_dec"
-    unpacked = BUILD / f"_{tag}_unpacked"
-    for d in (raw, dec, unpacked):
+    for d in (raw, dec):
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True)
-    # extract_ncs.py silently finds nothing in pakchunk4; repak works.
-    run([REPAK, "unpack", "-i", "Engine/Content/_NCS", "-o", unpacked, pak])
-    source = next(unpacked.rglob(filename), None)
-    if source is None:
-        raise SystemExit(f"could not extract {filename} from {pak.name}")
-    shutil.copy(source, raw / filename)
+    shutil.copy(carved, raw / filename)
     run([sys.executable, SCRIPTS / "ncs_decomp.py", raw, dec])
     payload = dec / (filename + ".bin")
     if not payload.exists():

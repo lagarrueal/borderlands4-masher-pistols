@@ -661,7 +661,17 @@ decrypted `11.sav` (Loveless, `Char_CorpoHacker`) before and after:
   mods. Those were only hidden in game and came back once the pak was
   removed.
 
-Cause unknown. Type 402 has no top-level definition in inv0, inv4 or inv6. It
+**Cause (found after the null-pak control reproduced it): the build read a
+stale inv4.** repak panics on `pakchunk4-Windows_20_P.pak`, so the build took
+Windows_18 as newest. `classmod_corpohacker`, the class mods of the newest
+class (serial type 402), exists only in W20's inv4. The mod pak shadowed W20,
+so those items could not resolve. Even the unchanged repack deleted them.
+`build_masher_pak.py` now finds sources by grepping raw pak bytes and carving
+them (`../scripts/carve_ncs.py`). Rebuilt from W20, every position moved: key
+index 532 -> 244, not 582 -> 302.
+
+Original notes, from before the cause was known: type 402 has no top-level
+definition in inv0, inv4 or inv6. It
 appears in inv4 only as a nested `_scope: Sub` serialindex inside every class
 mod's `passive_points` entries. The decode check proved the file differs by
 one field *as bl4.exe reads it*. The game evidently reads it differently, or
