@@ -677,6 +677,8 @@ _save_source: tuple[WeakPointer, str, str] | None = None
 _current_save: str | None = None
 _next_save_lookup = 0.0
 _save_fallback_reported = False
+# Holders already announced, so a new PlayerState per map is not re-logged.
+_save_labels_reported: set[str] = set()
 
 
 def _format_guid(value: Any) -> str | None:
@@ -699,22 +701,21 @@ def _format_guid(value: Any) -> str | None:
     return "".join(f"{part:08X}" for part in parts)
 
 
-def _save_id_holders() -> list[tuple[str, UObject]]:
-    """Every object that might hold the loaded character's GUID."""
+def _save_id_holders(search: bool = True) -> list[tuple[str, UObject]]:
+    """Every object that might hold the loaded character's GUID.
+
+    Measured in game: `PlayerState.ActiveCharGuid` holds it, matching the
+    save's `char_guid`. The player's own objects come first because reaching
+    them needs no object-list walk; a new level brings a new PlayerState, so
+    this runs after every map load. The profile classes are only walked, with
+    `search`, if none of those answers.
+    """
     holders: list[tuple[str, UObject]] = []
-    for class_name in ("OakActiveProfile", "GbxActiveProfile"):
-        try:
-            for obj in unrealsdk.find_all(class_name, False):
-                if obj != obj.Class.ClassDefaultObject:
-                    holders.append((class_name, obj))
-        except Exception:
-            continue
     try:
         pc = get_pc()
     except Exception:
         pc = None
     if pc is not None:
-        holders.append(("PlayerController", pc))
         for field, label in (("PlayerState", "PlayerState"), ("Player", "LocalPlayer")):
             try:
                 linked = getattr(pc, field)
@@ -722,6 +723,15 @@ def _save_id_holders() -> list[tuple[str, UObject]]:
                 continue
             if linked is not None:
                 holders.append((label, linked))
+        holders.append(("PlayerController", pc))
+    if search:
+        for class_name in ("OakActiveProfile", "GbxActiveProfile"):
+            try:
+                for obj in unrealsdk.find_all(class_name, False):
+                    if obj != obj.Class.ClassDefaultObject:
+                        holders.append((class_name, obj))
+            except Exception:
+                continue
     return holders
 
 
@@ -739,16 +749,19 @@ def _read_save_guid() -> str | None:
                 return guid
         _save_source = None
 
-    for label, holder in _save_id_holders():
-        for field in SAVE_ID_FIELDS:
-            try:
-                guid = _format_guid(getattr(holder, field))
-            except Exception:
-                continue
-            if guid:
-                _save_source = (WeakPointer(holder), field, f"{label}.{field}")
-                log(f"saves told apart by {label}.{field} (character {guid})")
-                return guid
+    for search in (False, True):
+        for label, holder in _save_id_holders(search):
+            for field in SAVE_ID_FIELDS:
+                try:
+                    guid = _format_guid(getattr(holder, field))
+                except Exception:
+                    continue
+                if guid:
+                    _save_source = (WeakPointer(holder), field, f"{label}.{field}")
+                    if label not in _save_labels_reported:
+                        _save_labels_reported.add(label)
+                        log(f"saves told apart by {label}.{field} (character {guid})")
+                    return guid
     return None
 
 

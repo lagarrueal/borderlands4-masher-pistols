@@ -204,7 +204,7 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-204 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+208 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.

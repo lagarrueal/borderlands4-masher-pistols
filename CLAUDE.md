@@ -279,8 +279,17 @@ stock UE `LocalPlayerSaveGame`, which BL4 does not appear to use).
 `LocalPlayer`, keeps a weak pointer to whichever answers, and re-reads only
 that field on later sweeps, so a character switch is seen without searching
 again. Until something answers, a search runs at most every 10s, and verdicts
-go to `unknown-character.json`. **Unverified in game:** which holder answers.
-`masher save` prints every candidate and its value.
+go to `unknown-character.json`.
+
+**Measured in game** (`masher save`, 2026-09-29): only
+`OakPlayerState.ActiveCharGuid` exists, reading
+`{A: 996610406, B: 1098337707, C: -1788925260, D: 392800609}`. That formats to
+`3B67116641774DAB955F2AB41769A961`, exactly slot 11's `char_guid`.
+`OakActiveProfile` (under `OakGameInstance...OakProfileProgressVault`), the
+controller and `OakLocalPlayer` have neither field. `C` is negative, so the
+unsigned mask matters. The player's own objects are therefore tried before
+the profile classes are walked: a new level brings a new PlayerState, and this
+way re-finding it costs no object-list walk.
 
 `FGuid` members are read as `A, B, C, D` and formatted `%08X` each (unsigned),
 which is how the save writes `char_guid`. An all-zero GUID means no character

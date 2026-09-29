@@ -87,6 +87,7 @@ def reset_mod() -> None:
     jm._current_save = None
     jm._next_save_lookup = 0.0
     jm._save_fallback_reported = False
+    jm._save_labels_reported.clear()
     import shutil as _shutil
 
     _shutil.rmtree(jm.registry_dir(), ignore_errors=True)
@@ -1204,6 +1205,50 @@ check("a GUID on the player controller is found", jm.refresh_save_id(force=True)
 check("and its holder remembered", jm._save_source is not None and jm._save_source[2] == "PlayerController.ActiveCharGuid", str(jm._save_source))
 env.set_player(None)
 
+# The measured holder: PlayerState. Found without walking the object list, and
+# a fresh PlayerState after a map load is picked up without re-announcing.
+reset_mod()
+_profile["obj"] = None
+pc, pawn = make_player()
+
+
+def player_state(name):
+    return env.FakeObject(
+        "OakPlayerState",
+        path=f"World.{name}",
+        ActiveCharGuid=env.WrappedStruct(A=LOVELESS[0], B=LOVELESS[1], C=LOVELESS[2], D=LOVELESS[3]),
+    )
+
+
+pc._props["PlayerState"] = player_state("PlayerState_0")
+walks = {"n": 0}
+real_find_all_ps = jm.unrealsdk.find_all
+
+
+def counting_ps(*a, **kw):
+    walks["n"] += 1
+    return real_find_all_ps(*a, **kw)
+
+
+jm.unrealsdk.find_all = counting_ps
+buf_ps = __import__("io").StringIO()
+with __import__("contextlib").redirect_stdout(buf_ps):
+    got = jm.refresh_save_id(force=True)
+    source_label = jm._save_source[2]
+    jm._save_source[0].kill()  # map load: the old PlayerState is gone
+    pc._props["PlayerState"] = player_state("PlayerState_1")
+    again = jm.refresh_save_id(force=True)
+jm.unrealsdk.find_all = real_find_all_ps
+check(
+    "PlayerState.ActiveCharGuid identifies the save",
+    got == "3B67116641774DAB955F2AB41769A961" and source_label == "PlayerState.ActiveCharGuid",
+    f"{got} via {source_label}",
+)
+check("without walking the object list", walks["n"] == 0, str(walks["n"]))
+check("a new PlayerState after a map load is found again", again == got)
+check("and announced only once", buf_ps.getvalue().count("saves told apart") == 1, buf_ps.getvalue())
+env.set_player(None)
+
 # No holder at all: one shared record, reported once, searched rarely.
 reset_mod()
 buf_u = __import__("io").StringIO()
@@ -1215,7 +1260,7 @@ check("unidentified saves share one record", first == jm.UNKNOWN_SAVE_ID)
 check("reported once", buf_u.getvalue().count("cannot tell which character") == 1, buf_u.getvalue())
 searches = {"n": 0}
 real_holders = jm._save_id_holders
-jm._save_id_holders = lambda: searches.__setitem__("n", searches["n"] + 1) or []
+jm._save_id_holders = lambda search=True: searches.__setitem__("n", searches["n"] + 1) or []
 for _ in range(20):
     jm.refresh_save_id()
 jm._save_id_holders = real_holders
