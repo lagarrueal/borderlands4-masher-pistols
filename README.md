@@ -33,7 +33,7 @@ Mods load at **startup only** — fully exit and relaunch, not just back to menu
 > When it enables it announces itself:
 >
 > ```
-> [jakobs_masher] enabled - 6 projectiles at 0.40x damage, 1 in 4 revolvers
+> [jakobs_masher] enabled - 6 projectiles at 0.40x damage, 25% of Jakobs revolvers
 > [jakobs_masher] hooks bound: ServerStartUsing, ServerEquipInterruptible, ...
 > ```
 
@@ -46,7 +46,7 @@ All are live-adjustable from the mods menu.
 | Projectiles Per Shot | 6 | what BL3's Masher barrel fired |
 | Damage Per Projectile | 0.40 | 6 × 0.40 = **2.4× card damage** on a full hit |
 | Spread Multiplier | 3.0 | wide enough to read as a Masher, tight enough to aim |
-| Masher Frequency (in 4) | 1 | roughly a quarter of Jakobs revolvers |
+| Masher Chance (%) | 25 | share of Jakobs revolvers that are Mashers; 17 is about 1 in 6 |
 | Player Weapons Only | On | do not turn enemy revolvers into Mashers too |
 | Automatic Scanning | On | convert new guns without pressing anything |
 | Scan Interval | 3s | how often the background heartbeat may re-scan |
@@ -83,10 +83,40 @@ work that way: it draws cards for guns you are not holding.
 
 ### Which revolvers become Mashers
 
-The decision is derived from the weapon's **part indices** — the same numbers
-its serial encodes — so a given revolver is a Masher in every session, or in
-none. It is a property of the gun, not a per-shot roll, exactly as a barrel
-part would be. Changing **Masher Frequency** reshuffles which guns qualify.
+The decision is derived from the weapon's **part indices**, the same numbers
+its serial encodes. So a given revolver is a Masher in every session or in
+none: it is a property of the gun, not a per-shot roll, exactly as a barrel
+part would be.
+
+It is decided when the gun **drops**, not when you pick it up. A gun lying on
+the ground or sitting in your backpack has no live weapon to change, so it is
+*applied* when you equip it, but the answer was fixed by its parts all along.
+
+Each gun's parts place it somewhere from 0 to 100, and it is a Masher when that
+number is below **Masher Chance**. So the setting is nested:
+
+- **raising** it only ever adds Mashers, and **lowering** it only removes them;
+  no gun flips the other way;
+- changes apply to guns you are holding **straight away**, on the next key
+  press. Closing the menu is enough;
+- **0** turns every Masher back into a plain revolver, and **100** converts
+  every Jakobs pistol.
+
+`masher mine` prints each gun's part numbers and roll:
+
+```
+  JAK_PS     jakobs_pistol=True masher=True
+      parts = 3, 17, 0, 2, 5, 1, 0, 4
+      roll 12.40 vs chance 25%
+```
+
+Two different revolvers must show different `parts`. If every gun shows the
+same numbers, every gun rolls alike and the chance becomes all-or-nothing, so
+that line is the thing to report.
+
+> Upgrading from 1.0: the old **Masher Frequency (in 4)** setting is not
+> carried over. The new option starts at 25%; set 100 to convert every
+> Jakobs pistol as before.
 
 ## How it applies itself
 
@@ -162,7 +192,7 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-139 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+160 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.
@@ -170,7 +200,7 @@ and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 Covers Jakobs-pistol detection through nested objects, arrays and reference
 cycles; explicit tags outranking the directory heuristic; ownership filtering;
 knobs resolving to whichever property the engine actually exposes, including
-values hidden behind attribute structs; roll stability and distribution; damage not compounding across repeated shots; buffs
+values hidden behind attribute structs; roll stability and distribution at any chance; the chance being nested (raising it only adds Mashers); chance changes converting and reverting guns already seen; damage not compounding across repeated shots; buffs
 surviving a rescale; clean restore; caching; hook fire counting; and graceful
 degradation when properties are missing.
 
@@ -193,7 +223,9 @@ These cover the mod's logic. They cannot cover the live object graph — see
   it first applies, and then leaves `Value` to the engine so buffs and debuffs
   still stack on top. `masher probe` dumps
   them in full.
-- Disabling the mod restores every gun it touched.
+- Disabling the mod restores every gun it touched. Nothing is ever written
+  to your save or to the item itself, only to the live weapon, so
+  disabling or uninstalling leaves your guns exactly as they were.
 
 ## Licence
 

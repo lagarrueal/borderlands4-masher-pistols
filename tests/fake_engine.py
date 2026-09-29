@@ -242,6 +242,7 @@ def install() -> None:
         value: Any
         display_name: str | None = None
         description: str = ""
+        on_change_while_enabled: Any = None
 
     def SliderOption(  # noqa: N802
         identifier, value, min_value, max_value, step=1, is_integer=True, **kw
@@ -251,10 +252,22 @@ def install() -> None:
         if is_integer:
             for x in (value, min_value, max_value, step):
                 assert x == int(x), f"{identifier} non-integer field with is_integer"
-        return _Option(identifier, value, kw.get("display_name"), kw.get("description", ""))
+        return _Option(
+            identifier,
+            value,
+            kw.get("display_name"),
+            kw.get("description", ""),
+            kw.get("on_change_while_enabled"),
+        )
 
     def BoolOption(identifier, value, true_text=None, false_text=None, **kw):  # noqa: N802
-        return _Option(identifier, value, kw.get("display_name"), kw.get("description", ""))
+        return _Option(
+            identifier,
+            value,
+            kw.get("display_name"),
+            kw.get("description", ""),
+            kw.get("on_change_while_enabled"),
+        )
 
     REGISTERED: dict[str, Any] = {
         "hooks": [],

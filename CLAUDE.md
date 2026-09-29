@@ -220,6 +220,32 @@ heartbeat may sweep every 0.5s — because the weapon actor and its ownership
 arrive a moment *after* the event that announced them. A sweep that raises is
 contained rather than escaping into the engine.
 
+### The roll is cached, the verdict is not
+
+Version 1.0 cached `is_masher` per weapon and rolled `(hash & 3) < frequency`.
+Two consequences, both contradicting the option's own description: a gun
+already seen kept its answer when the frequency changed (until a swap respawned
+it as a new actor), and frequency 0 disabled nothing that was already converted.
+The description also claimed that changing the setting "reshuffles" which guns
+qualify, which was wrong: a threshold on a fixed hash is nested.
+
+Now `masher_roll()` places each gun at `hash % 10000 / 100` on 0..100, the cache
+stores that roll (`(path, pointers, roll, is_jakobs)`), and `process_weapon`
+re-derives `roll < Masher Chance` every pass. A gun that stops qualifying,
+because the chance was lowered or because it is not yours once `Player Weapons
+Only` is on, is put back by `restore_behaviour()`, which also drops its
+bookkeeping so a later re-conversion anchors on the restored numbers. 100 also
+converts a gun with no identity to roll, so "every Jakobs pistol" is literal.
+
+mods_base's `on_change_while_enabled` fires **before** the new value is stored,
+so the callback does not sweep, because that would evaluate the old value. It
+opens the fast window, and the next key press sweeps with the new one.
+
+**Unverified in game:** whether `GetPartValue` actually differs between two
+revolvers. At 4/4 every gun converted regardless, so the spread has never been
+exercised live. `masher mine` now prints `parts = ...` for each Jakobs pistol
+to settle it.
+
 ### Ownership must never be cached as a no
 
 Measured: picking up a Jakobs revolver logged

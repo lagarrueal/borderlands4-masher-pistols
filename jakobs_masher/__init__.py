@@ -39,7 +39,7 @@ from mods_base import (
 from unrealsdk.hooks import Type
 from unrealsdk.unreal import BoundFunction, UObject, WeakPointer, WrappedStruct
 
-__version__ = "1.0"
+__version__ = "1.1"
 __author__ = "Claude"
 
 # --------------------------------------------------------------------------- #
@@ -81,6 +81,16 @@ def debug(msg: str) -> None:
 # Options
 # --------------------------------------------------------------------------- #
 
+def _on_setting_change(_option: Any, _value: Any) -> None:
+    """Re-evaluate the guns you are holding soon after a setting moves.
+
+    mods_base calls this *before* the new value is stored, so sweeping here
+    would still see the old one. Opening the fast window instead makes the
+    next key press - closing the menu is enough - sweep with the new value.
+    """
+    request_follow_up()
+
+
 projectiles = SliderOption(
     "Projectiles Per Shot",
     6,
@@ -91,6 +101,7 @@ projectiles = SliderOption(
         "How many projectiles a Masher fires per trigger pull. BL3's Masher"
         " barrel fired 6."
     ),
+    on_change_while_enabled=_on_setting_change,
 )
 
 damage_scale = SliderOption(
@@ -105,6 +116,7 @@ damage_scale = SliderOption(
         "Each projectile deals this fraction of the gun's normal damage."
         " 6 projectiles at 0.40 gives 2.4x total, matching BL3."
     ),
+    on_change_while_enabled=_on_setting_change,
 )
 
 spread_scale = SliderOption(
@@ -119,20 +131,24 @@ spread_scale = SliderOption(
         "How much wider a Masher shoots than the same gun would normally."
         " Higher means more shotgun, less revolver."
     ),
+    on_change_while_enabled=_on_setting_change,
 )
 
-masher_frequency = SliderOption(
-    "Masher Frequency",
-    1,
+masher_chance = SliderOption(
+    "Masher Chance",
+    25,
     0,
-    4,
-    display_name="Masher Frequency (in 4)",
+    100,
+    display_name="Masher Chance (%)",
     description=(
-        "Roughly how many Jakobs revolvers out of every four are Mashers."
-        " The roll comes from the gun's own parts, so a given revolver is"
-        " always a Masher or never one - but changing this setting reshuffles"
-        " which guns qualify. 0 disables, 4 converts every Jakobs pistol."
+        "What share of Jakobs revolvers are Mashers - 17 is about one in six."
+        " Each gun's answer comes from its own parts, so a given revolver keeps"
+        " it in every session. Raising this only ever adds Mashers and"
+        " lowering it only removes them; no gun flips the other way. Guns you"
+        " are holding update straight away: 0 turns every Masher back into a"
+        " plain revolver, 100 converts every Jakobs pistol."
     ),
+    on_change_while_enabled=_on_setting_change,
 )
 
 player_weapons_only = BoolOption(
@@ -147,6 +163,7 @@ player_weapons_only = BoolOption(
         " 2.4x damage enemy. Turn off to convert every Jakobs revolver in the"
         " world."
     ),
+    on_change_while_enabled=_on_setting_change,
 )
 
 auto_scan = BoolOption(
@@ -531,24 +548,42 @@ def stat_fingerprint(behaviours: list[UObject]) -> tuple[int, ...]:
 # --------------------------------------------------------------------------- #
 
 
-def rolls_masher(weapon: UObject, behaviours: list[UObject]) -> bool:
-    """Is this particular revolver a Masher?
+def roll_identity(weapon: UObject, behaviours: list[UObject]) -> tuple[str, tuple[int, ...]]:
+    """What the roll is computed from, and where it came from."""
+    parts = part_values(weapon)
+    if parts:
+        return "parts", parts
+    return "stat fingerprint", stat_fingerprint(behaviours)
+
+
+# The roll lands on 0.00 .. 99.99, in hundredths of a percent.
+ROLL_BUCKETS = 100 * 100
+
+
+def masher_roll(weapon: UObject, behaviours: list[UObject]) -> float | None:
+    """Where this particular revolver sits on 0..100. None if it has no identity.
 
     BL3 made Masher a barrel part, so Masher-ness here is likewise a fixed
-    property of the gun rather than a per-shot coin flip: the decision is
-    derived from the weapon's part indices, the same numbers its serial
-    encodes. The same revolver therefore answers the same way in every
-    session, and only a fraction of drops qualify.
+    property of the gun rather than a per-shot coin flip: the roll is derived
+    from the weapon's part indices, the same numbers its serial encodes. The
+    same revolver therefore rolls the same in every session - it is decided
+    when the gun drops, even though it can only be applied once there is a
+    live weapon to apply it to.
+
+    The roll is a position, not a verdict: a gun is a Masher when its roll is
+    below `Masher Chance`. That makes the setting nested - raising it only adds
+    guns, lowering it only removes them - and lets a cached roll answer a new
+    setting without recomputing anything.
 
     (The part slots are read as an opaque list - the game does not tell us
     which index is the barrel - so this is a hash over the whole roll rather
     than a literal barrel-variant check.)
     """
-    identity = part_values(weapon) or stat_fingerprint(behaviours)
+    _source, identity = roll_identity(weapon, behaviours)
     if not identity:
-        return False
+        return None
 
-    # A cheap, stable spread of the part roll over 0..3.
+    # A cheap, stable spread of the part roll.
     mixed = 0
     for index, value in enumerate(identity):
         mixed = (mixed * 31 + value * (index + 7)) & 0xFFFFFFFF
@@ -556,7 +591,20 @@ def rolls_masher(weapon: UObject, behaviours: list[UObject]) -> bool:
     mixed = (mixed * 0x45D9F3B) & 0xFFFFFFFF
     mixed ^= mixed >> 16
 
-    return (mixed & 3) < masher_frequency.value
+    return (mixed % ROLL_BUCKETS) / 100.0
+
+
+def is_masher_roll(roll: float | None) -> bool:
+    """Does a roll qualify under the current `Masher Chance`?"""
+    chance = float(masher_chance.value)
+    if chance >= 100:
+        return True  # "every Jakobs pistol" - even one we could not roll
+    return roll is not None and roll < chance
+
+
+def rolls_masher(weapon: UObject, behaviours: list[UObject]) -> bool:
+    """Is this particular revolver a Masher, at the current setting?"""
+    return is_masher_roll(masher_roll(weapon, behaviours))
 
 
 # --------------------------------------------------------------------------- #
@@ -568,9 +616,20 @@ def rolls_masher(weapon: UObject, behaviours: list[UObject]) -> bool:
 # without us either fighting it or compounding our own multiplier.
 _touched: dict[int, dict[str, Any]] = {}
 
-# Weapon address -> (path name, behaviour pointers, is a masher). The path name
-# guards against the engine recycling an address for a different weapon.
-_weapon_cache: dict[int, tuple[str, list[WeakPointer], bool]] = {}
+# Weapon address -> (path name, behaviour pointers, roll, is a Jakobs pistol).
+# The path name guards against the engine recycling an address for a different
+# weapon. The roll is cached rather than the verdict, so a change to `Masher
+# Chance` is answered on the next pass without re-identifying anything.
+_weapon_cache: dict[int, tuple[str, list[WeakPointer], float | None, bool]] = {}
+
+
+def cached_masher(weapon: UObject) -> bool | None:
+    """Is this weapon a Masher under the current setting? None if never seen."""
+    cached = _weapon_cache.get(weapon._get_address())
+    if cached is None:
+        return None
+    _path, _pointers, roll, jakobs = cached
+    return jakobs and is_masher_roll(roll)
 
 
 # Which property carries each knob is not obvious, and neither is its type.
@@ -902,24 +961,36 @@ def make_masher(behaviour: UObject) -> list[str]:
     return applied
 
 
+def restore_behaviour(behaviour: UObject) -> bool:
+    """Put one fire behaviour back the way we found it. False if untouched.
+
+    Its bookkeeping goes with it, so converting it again later anchors afresh
+    on the restored values.
+    """
+    address = behaviour._get_address()
+    state = _touched.pop(address, None)
+    if not state:
+        return False
+    # Records are keyed per struct member, so group them back per property
+    # and restore every member in one write.
+    by_property: dict[str, dict[str | None, float]] = {}
+    for record in state.values():
+        by_property.setdefault(record["field"], {})[record["subfield"]] = record[
+            "original"
+        ]
+    for field, originals in by_property.items():
+        subfields = tuple(n for n in originals if n is not None)
+        _apply_numbers(behaviour, field, subfields, originals)
+    _drift_reported.discard(address)
+    return True
+
+
 def restore_all() -> None:
     """Undo every change we made to behaviours that still exist."""
     restored = 0
     for behaviour in unrealsdk.find_all(FIRE_BEHAVIOUR_CLASS, False):
-        state = _touched.get(behaviour._get_address())
-        if not state:
-            continue
-        # Records are keyed per struct member, so group them back per
-        # property and restore every member in one write.
-        by_property: dict[str, dict[str | None, float]] = {}
-        for record in state.values():
-            by_property.setdefault(record["field"], {})[record["subfield"]] = record[
-                "original"
-            ]
-        for field, originals in by_property.items():
-            subfields = tuple(n for n in originals if n is not None)
-            _apply_numbers(behaviour, field, subfields, originals)
-        restored += 1
+        if restore_behaviour(behaviour):
+            restored += 1
     _touched.clear()
     _weapon_cache.clear()
     _identity_cache.clear()
@@ -1037,61 +1108,88 @@ def process_weapon(weapon: UObject, known: list[UObject] | None = None) -> None:
     path = weapon._path_name()
     cached = _weapon_cache.get(address)
 
+    behaviours: list[UObject] | None = None
+    first_sight = False
     if cached is not None and cached[0] == path:
-        _, pointers, is_masher = cached
+        _, pointers, roll, jakobs = cached
+        if not jakobs:
+            return
         behaviours = [b for b in (p() for p in pointers) if b is not None]
-        if len(behaviours) == len(pointers):
-            if is_masher:
-                for behaviour in behaviours:
-                    make_masher(behaviour)
-            return
-        # Something was garbage collected - fall through and rescan.
+        if len(behaviours) != len(pointers):
+            behaviours = None  # something was garbage collected - rescan
 
-    if not is_jakobs_pistol(weapon):
-        _weapon_cache[address] = (path, [], False)
-        return
-
-    if player_weapons_only.value:
-        global _ownership_warned
-        owned = is_player_weapon(weapon)
-        if owned is False:
-            # Deliberately NOT cached. Picking a gun up fires the use event
-            # before the game hands the weapon over, so this runs while the
-            # revolver still belongs to nobody. Caching that verdict made
-            # every picked-up gun permanently ineligible until a swap
-            # respawned it as a new actor. Ownership is cheap to re-check;
-            # identity and the roll are what get cached.
-            if address not in _not_ours_reported:
-                _not_ours_reported.add(address)
-                debug(f"{path} is a Jakobs revolver, but not ours (yet) - will re-check")
+    if behaviours is None:
+        if not is_jakobs_pistol(weapon):
+            _weapon_cache[address] = (path, [], None, False)
             return
-        if owned is None and not _ownership_warned:
-            _ownership_warned = True
+        behaviours = known if known is not None else fire_behaviours_of(weapon)
+        if not behaviours:
+            debug(f"no {FIRE_BEHAVIOUR_CLASS} found under {path}")
+            return
+        roll = masher_roll(weapon, behaviours)
+        _weapon_cache[address] = (path, [WeakPointer(b) for b in behaviours], roll, True)
+        first_sight = True
+
+    # The verdict is re-derived every pass from the cached roll, so moving
+    # `Masher Chance` converts or reverts guns already seen - including
+    # setting it to 0, which turns every Masher back into a revolver.
+    wanted = is_masher_roll(roll) and _eligible_owner(weapon, address, path)
+    converted = any(b._get_address() in _touched for b in behaviours)
+
+    if wanted:
+        applied: list[str] = []
+        for behaviour in behaviours:
+            applied = make_masher(behaviour)
+        if not converted:
             log(
-                "cannot tell who owns a weapon - converting all of them,"
-                " enemies included. Turn off 'Player Weapons Only' to silence"
-                " this, or report it."
+                f"Masher: {path} -> {int(projectiles.value)} projectiles"
+                f" (roll {_describe_roll(roll)}; {', '.join(applied) or 'nothing applied'})"
             )
-
-    behaviours = known if known is not None else fire_behaviours_of(weapon)
-    if not behaviours:
-        debug(f"no {FIRE_BEHAVIOUR_CLASS} found under {path}")
         return
 
-    is_masher = rolls_masher(weapon, behaviours)
-    _weapon_cache[address] = (path, [WeakPointer(b) for b in behaviours], is_masher)
-
-    if not is_masher:
-        debug(f"{weapon._path_name()} is a plain Jakobs revolver")
+    if converted:
+        for behaviour in behaviours:
+            restore_behaviour(behaviour)
+        log(f"no longer a Masher, restored: {path} (roll {_describe_roll(roll)})")
         return
 
-    applied: list[str] = []
-    for behaviour in behaviours:
-        applied = make_masher(behaviour)
-    log(
-        f"Masher: {weapon._path_name()} -> "
-        f"{int(projectiles.value)} projectiles ({', '.join(applied) or 'nothing applied'})"
-    )
+    if first_sight:
+        debug(f"{path} is a plain Jakobs revolver (roll {_describe_roll(roll)})")
+
+
+def _describe_roll(roll: float | None) -> str:
+    chance = int(masher_chance.value)
+    if roll is None:
+        return f"none - no identity, chance {chance}%"
+    return f"{roll:.2f} vs chance {chance}%"
+
+
+def _eligible_owner(weapon: UObject, address: int, path: str) -> bool:
+    """Does `Player Weapons Only` allow this weapon? Re-checked every pass.
+
+    Never cached. Picking a gun up fires the use event before the game hands
+    the weapon over, so the first look sees a revolver owned by nobody.
+    Caching that verdict made every picked-up gun permanently ineligible until
+    a swap respawned it as a new actor. Identity and the roll are what get
+    cached; ownership is cheap to re-check.
+    """
+    global _ownership_warned
+    if not player_weapons_only.value:
+        return True
+    owned = is_player_weapon(weapon)
+    if owned is False:
+        if address not in _not_ours_reported:
+            _not_ours_reported.add(address)
+            debug(f"{path} is a Jakobs revolver, but not ours (yet) - will re-check")
+        return False
+    if owned is None and not _ownership_warned:
+        _ownership_warned = True
+        log(
+            "cannot tell who owns a weapon - converting all of them,"
+            " enemies included. Turn off 'Player Weapons Only' to silence"
+            " this, or report it."
+        )
+    return True
 
 
 # Which hooks have actually fired, and how often. BL4 may resolve a shot
@@ -1376,7 +1474,7 @@ def on_mod_enabled() -> None:
 
     log(f"enabled - {int(projectiles.value)} projectiles at "
         f"{float(damage_scale.value):.2f}x damage, "
-        f"{int(masher_frequency.value)} in 4 revolvers")
+        f"{int(masher_chance.value)}% of Jakobs revolvers")
     log(f"hooks bound: {', '.join(bound) if bound else 'NONE'}")
     if unbound:
         log(f"hooks NOT bound: {', '.join(unbound)}")
@@ -1434,8 +1532,14 @@ def masher_command(args: Any) -> None:
             f"  fired={_fires.get(INPUT_HEARTBEAT, 0)}"
         )
         log(f"weapons seen: {len(_weapon_cache)}, behaviours modified: {len(_touched)}")
-        for path, pointers, is_masher in _weapon_cache.values():
-            log(f"  masher={is_masher}  behaviours={len(pointers)}  {path}")
+        for path, pointers, roll, jakobs in _weapon_cache.values():
+            if not jakobs:
+                log(f"  not a Jakobs pistol  {path}")
+                continue
+            log(
+                f"  masher={is_masher_roll(roll)}  roll={_describe_roll(roll)}"
+                f"  behaviours={len(pointers)}  {path}"
+            )
         return
 
     if args.action == "scan":
@@ -1466,13 +1570,17 @@ def masher_command(args: Any) -> None:
                     for match in WEAPON_TAG_RE.finditer(text)
                 }
             )
-            cached = _weapon_cache.get(weapon._get_address())
-            masher = cached[2] if cached else None
-
             log(
                 f"  {'/'.join(tags) or 'untagged':<10}"
-                f" jakobs_pistol={jakobs} masher={masher}"
+                f" jakobs_pistol={jakobs} masher={cached_masher(weapon)}"
             )
+            if jakobs:
+                # What the per-gun decision is made from. Two different
+                # revolvers must show different numbers here, or every gun
+                # rolls alike and the chance is all-or-nothing.
+                source, identity = roll_identity(weapon, behaviours)
+                log(f"      {source} = {', '.join(map(str, identity)) or 'NONE'}")
+                log(f"      roll {_describe_roll(masher_roll(weapon, behaviours))}")
 
             # The item card is built from the item's own stats container, not
             # from the live behaviour this mod writes to, so it keeps showing
@@ -1532,11 +1640,10 @@ def masher_command(args: Any) -> None:
                     for match in WEAPON_TAG_RE.finditer(text)
                 }
             )
-            cached = _weapon_cache.get(weapon._get_address())
             log(
                 f"--- {'/'.join(tags) or 'untagged'}"
                 f" jakobs_pistol={is_jakobs_pistol(weapon)}"
-                f" masher={cached[2] if cached else None}"
+                f" masher={cached_masher(weapon)}"
             )
 
             for behaviour in behaviours:

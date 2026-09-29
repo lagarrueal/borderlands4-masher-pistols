@@ -213,7 +213,7 @@ def make_player():
 
 
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 pc, pawn = make_player()
 
 mine, mine_beh = make_weapon("JAK_PS", (1, 2, 3, 4))
@@ -266,7 +266,7 @@ check("GetPartValue marked usable", jm._part_values_work is True)
 # --------------------------------------------------------------------------- #
 print("\n== the masher roll is stable and proportioned ==")
 reset_mod()
-jm.masher_frequency.value = 2  # 2 of 4 barrel variants
+jm.masher_chance.value = 50
 
 # Deterministic: same parts -> same answer, every time.
 sample = [(3, 1, 4, 1), (0, 0, 0, 0), (9, 9, 9, 9), (2, 7, 1, 8)]
@@ -280,31 +280,43 @@ for parts in sample:
             stable = False
 check("same parts always give the same answer", stable)
 
-# Distribution: roughly masher_rarity/4 of guns.
-hits = 0
-total = 2000
-for i in range(total):
-    parts = (i % 17, (i // 17) % 19, (i // 323) % 7, (i * 7) % 23)
-    w, b = make_weapon("JAK_PS", parts)
-    if jm.rolls_masher(w, [b]):
-        hits += 1
-ratio = hits / total
-check(
-    "about half are mashers at frequency 2",
-    0.35 < ratio < 0.65,
-    f"{ratio:.1%}",
-)
+# Distribution: each chance setting converts about that share of guns.
+def roll_many(total=2000):
+    rolls = []
+    for i in range(total):
+        parts = (i % 17, (i // 17) % 19, (i // 323) % 7, (i * 7) % 23)
+        w, b = make_weapon("JAK_PS", parts)
+        rolls.append((parts, jm.masher_roll(w, [b])))
+    return rolls
 
-jm.masher_frequency.value = 1
-hits = sum(
-    jm.rolls_masher(*(lambda p: (lambda wb: (wb[0], [wb[1]]))(make_weapon("JAK_PS", p)))(
-        (i % 17, (i // 17) % 19, (i // 323) % 7, (i * 7) % 23)
-    ))
-    for i in range(total)
-)
-ratio1 = hits / total
-check("about a quarter at frequency 1", 0.13 < ratio1 < 0.37, f"{ratio1:.1%}")
-jm.masher_frequency.value = 2
+
+many = roll_many()
+check("every roll lands on 0..100", all(r is not None and 0 <= r < 100 for _, r in many))
+for chance, low, high in ((50, 0.43, 0.57), (25, 0.19, 0.31), (17, 0.12, 0.22), (5, 0.02, 0.08)):
+    jm.masher_chance.value = chance
+    ratio = sum(jm.is_masher_roll(r) for _, r in many) / len(many)
+    check(f"about {chance}% are mashers at chance {chance}", low < ratio < high, f"{ratio:.1%}")
+
+# Nested: every Masher at a low chance is still one at any higher chance, so
+# moving the slider up never takes a Masher away from you.
+nested = True
+for lower, higher in ((5, 17), (17, 25), (25, 50), (50, 99)):
+    for _, roll in many:
+        jm.masher_chance.value = lower
+        was = jm.is_masher_roll(roll)
+        jm.masher_chance.value = higher
+        if was and not jm.is_masher_roll(roll):
+            nested = False
+check("raising the chance only adds mashers", nested)
+
+jm.masher_chance.value = 0
+check("0 makes nothing a masher", not any(jm.is_masher_roll(r) for _, r in many))
+jm.masher_chance.value = 100
+check("100 makes everything a masher", all(jm.is_masher_roll(r) for _, r in many))
+check("100 includes a gun with no identity to roll", jm.is_masher_roll(None))
+jm.masher_chance.value = 99
+check("below 100 a gun with no identity is not one", not jm.is_masher_roll(None))
+jm.masher_chance.value = 50
 
 # --------------------------------------------------------------------------- #
 # The second in-game run applied nothing and could not say why: a failed write
@@ -312,7 +324,7 @@ jm.masher_frequency.value = 2
 # whichever candidate property the object actually has.
 print("\n== knobs resolve to whatever property exists ==")
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 
 w, b = make_weapon("JAK_PS", (1, 2, 3, 4))
 applied = jm.make_masher(b)
@@ -426,7 +438,7 @@ def make_struct_weapon(scalar_name=None, projectiles=1, damage=100.0, spread=1.0
 
 
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 sw, sb = make_struct_weapon()
 
 applied = jm.make_masher(sb)
@@ -481,7 +493,7 @@ check(
 
 # A differently-named scalar still resolves.
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 sw2, sb2 = make_struct_weapon(scalar_name="Constant")
 applied = jm.make_masher(sb2)
 check(
@@ -494,7 +506,7 @@ check("alternate scalar written", sb2.ProjectilesPerShot.Constant == 6)
 # A ratio between the members must survive scaling - Damage really runs
 # BaseValue 82 / Value 241, and flattening the two would wreck the modifiers.
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 ratio_w = env.FakeObject("OakWeapon", path="World.Ratio", BodyData="Body_JAK_PS")
 ratio_b = env.FakeObject(
     "WeaponBehavior_FireProjectile",
@@ -532,7 +544,7 @@ check(
 # A write that reports success but does not survive must be caught. This is the
 # difference between "the mod applied it" and "the game kept it".
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 dw, db = make_struct_weapon()
 jm.make_masher(db)
 check("no drift right after writing", jm.check_drift(db) == [], str(jm.check_drift(db)))
@@ -549,7 +561,7 @@ check(
 
 # A write that silently does nothing is caught too.
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 sticky_w = env.FakeObject(
     "OakWeapon", path="World.Sticky", BodyData="Body_JAK_PS"
 )
@@ -582,7 +594,7 @@ check(
 # "Unable to cast ... to C++ type 'int'". Damage and Spread are floats, which is
 # why spread worked in game while the projectile count silently did not.
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 int_w = env.FakeObject("OakWeapon", path="World.Ints", BodyData="Body_JAK_PS")
 
 
@@ -631,7 +643,7 @@ check("no drift on mixed types", jm.check_drift(int_b) == [], str(jm.check_drift
 
 # Scaling an integer member rounds rather than failing.
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 round_w = env.FakeObject("OakWeapon", path="World.Round", BodyData="Body_JAK_PS")
 round_b = env.FakeObject(
     "WeaponBehavior_FireProjectile",
@@ -653,7 +665,7 @@ check(
 # swap respawned them as new actors.
 print("\n== ownership is re-checked, never cached as a no ==")
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 pc, pawn = make_player()
 
 ground_w, ground_b = make_struct_weapon()
@@ -663,8 +675,8 @@ ground_w._props["WeaponUser"] = nobody  # mid-pickup: not handed over yet
 jm.maybe_scan("used an object", force=True)
 check("mid-pickup the gun is not converted", ground_b.ProjectilesPerShot.Value == 1)
 check(
-    "and the 'not ours' verdict is not cached",
-    ground_w._get_address() not in jm._weapon_cache,
+    "the gun is remembered as a Jakobs revolver, but not as 'not ours'",
+    jm._weapon_cache.get(ground_w._get_address(), (None,) * 4)[3] is True,
     str(jm._weapon_cache.get(ground_w._get_address())),
 )
 
@@ -674,7 +686,7 @@ check("once it is ours, the next pass converts it", ground_b.ProjectilesPerShot.
 
 # Re-checking every pass must not mean logging every pass.
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 pc, pawn = make_player()
 enemy_w, enemy_b = make_struct_weapon()
 enemy_w._props["WeaponUser"] = env.FakeObject("OakCharacter", path="World.Enemy")
@@ -788,7 +800,7 @@ check("disabling the mod stops it", len(env.RAW_KEYBINDS) == 0)
 # every buff every few seconds. The mod owns BaseValue; Value is only kicked.
 print("\n== BaseValue is owned, Value is left to the engine ==")
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 bw, bb = make_struct_weapon(damage=100.0)
 jm.make_masher(bb)
 check(
@@ -831,7 +843,7 @@ check(
 
 # End to end through the sweep, with the realistic shape.
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 pc, pawn = make_player()
 e2e_weapon, e2e_beh = make_struct_weapon()
 e2e_weapon._props["WeaponUser"] = pawn
@@ -844,7 +856,7 @@ print("\n== applying and restoring ==")
 reset_mod()
 w, b = make_weapon("JAK_PS", (1, 1, 1, 1), damage=100.0, spread=1.0)
 # Force it to be a masher regardless of the roll.
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 
 jm.process_weapon(w)
 check("projectiles raised", b.ProjectilesPerShot == 6, str(b.ProjectilesPerShot))
@@ -890,12 +902,12 @@ check("bookkeeping cleared", not jm._touched and not jm._weapon_cache)
 # --------------------------------------------------------------------------- #
 print("\n== non-mashers and non-jakobs are left alone ==")
 reset_mod()
-jm.masher_frequency.value = 0  # nothing rolls a masher
+jm.masher_chance.value = 0  # nothing rolls a masher
 w, b = make_weapon("JAK_PS", (1, 2, 3, 4))
 jm.process_weapon(w)
 check("plain revolver untouched", b.ProjectilesPerShot == 1 and b.Damage == 100.0)
 
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 sg, sgb = make_weapon("JAK_SG", (1, 2, 3, 4))
 jm.process_weapon(sg)
 check("jakobs shotgun untouched", sgb.ProjectilesPerShot == 1 and sgb.Damage == 100.0)
@@ -903,7 +915,7 @@ check("jakobs shotgun untouched", sgb.ProjectilesPerShot == 1 and sgb.Damage == 
 # --------------------------------------------------------------------------- #
 print("\n== caching ==")
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 w, b = make_weapon("JAK_PS", (1, 2, 3, 4))
 jm.process_weapon(w)
 calls = {"n": 0}
@@ -922,7 +934,7 @@ check("cached path does not rescan the object list", calls["n"] == 0, f"{calls['
 jm.unrealsdk.find_all = real_find_all
 
 # A garbage-collected behaviour forces a rescan rather than crashing.
-path, pointers, is_masher = jm._weapon_cache[w._get_address()]
+path, pointers, roll, jakobs = jm._weapon_cache[w._get_address()]
 pointers[0].kill()
 try:
     jm.process_weapon(w)
@@ -931,9 +943,91 @@ except Exception as exc:  # noqa: BLE001
     check("survives a collected behaviour", False, repr(exc))
 
 # --------------------------------------------------------------------------- #
+# The old frequency slider cached the verdict, so a gun already seen kept its
+# old answer until re-equipped, and "0 disables" did not disable anything.
+print("\n== changing the chance applies to guns already seen ==")
+reset_mod()
+jm.masher_chance.value = 50
+pool = []
+for i in range(40):
+    cw, cb = make_weapon("JAK_PS", (i, i * 3 % 11, 7, i % 5))
+    pool.append((cw, cb))
+    jm.process_weapon(cw)
+
+
+def mashers_now():
+    return sum(cb.ProjectilesPerShot == 6 for _, cb in pool)
+
+
+at_half = mashers_now()
+check("some but not all convert at 50%", 0 < at_half < len(pool), f"{at_half}/{len(pool)}")
+check(
+    "each converted gun is one whose roll qualifies",
+    all((cb.ProjectilesPerShot == 6) == jm.cached_masher(cw) for cw, cb in pool),
+)
+
+jm.masher_chance.value = 0
+for cw, _ in pool:
+    jm.process_weapon(cw)
+check("0% turns every masher back into a revolver", mashers_now() == 0, str(mashers_now()))
+check(
+    "with the original numbers",
+    all(cb.Damage == 100.0 and cb.Spread == 1.0 for _, cb in pool),
+)
+check("and drops their bookkeeping", not jm._touched, str(len(jm._touched)))
+
+jm.masher_chance.value = 100
+for cw, _ in pool:
+    jm.process_weapon(cw)
+check("100% converts all of them, without re-identifying", mashers_now() == len(pool))
+check(
+    "anchored on the restored values, not compounded",
+    all(abs(cb.Damage - 40.0) < 1e-6 for _, cb in pool),
+    str(sorted({round(cb.Damage, 3) for _, cb in pool})),
+)
+
+jm.masher_chance.value = 50
+for cw, _ in pool:
+    jm.process_weapon(cw)
+check("back to 50%, the same guns as before", mashers_now() == at_half, f"{mashers_now()} vs {at_half}")
+
+# Turning 'Player Weapons Only' on reverts revolvers that are not yours.
+reset_mod()
+jm.masher_chance.value = 100
+jm.player_weapons_only.value = False
+pc, pawn = make_player()
+foe_w, foe_b = make_struct_weapon()
+foe_w._props["WeaponUser"] = env.FakeObject("OakCharacter", path="World.Foe")
+jm.process_weapon(foe_w)
+check("with the option off an enemy revolver converts", foe_b.ProjectilesPerShot.Value == 6)
+jm.player_weapons_only.value = True
+jm.process_weapon(foe_w)
+check("turning it on reverts it", foe_b.ProjectilesPerShot.Value == 1, str(foe_b.ProjectilesPerShot.Value))
+env.set_player(None)
+
+# A setting change is noticed promptly. mods_base calls back *before* storing
+# the new value, so the callback must not sweep - it opens the fast window.
+jm._fast_until = 0.0
+swept = {"n": 0}
+real_scan_all3 = jm.scan_all
+jm.scan_all = lambda: swept.__setitem__("n", swept["n"] + 1) or 0
+jm._on_setting_change(jm.masher_chance, 17)
+check("a setting change does not sweep with the stale value", swept["n"] == 0)
+check("it opens the fast window instead", jm._fast_until > jm.time.monotonic())
+jm.scan_all = real_scan_all3
+jm._fast_until = 0.0
+check(
+    "the chance and knob options all carry the callback",
+    all(
+        o.on_change_while_enabled is jm._on_setting_change
+        for o in (jm.masher_chance, jm.projectiles, jm.damage_scale, jm.spread_scale, jm.player_weapons_only)
+    ),
+)
+
+# --------------------------------------------------------------------------- #
 print("\n== missing properties degrade gracefully ==")
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 weapon = env.FakeObject(
     "OakWeapon",
     path="World.Odd_JAK_PS",
@@ -958,7 +1052,7 @@ except Exception as exc:  # noqa: BLE001
 # --------------------------------------------------------------------------- #
 print("\n== hook-independent scan ==")
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 w1, b1 = make_weapon("JAK_PS", (1, 2, 3, 4))
 w2, b2 = make_weapon("JAK_PS", (5, 6, 7, 8))
 sg, sgb = make_weapon("JAK_SG", (1, 2, 3, 4))
@@ -1009,7 +1103,7 @@ real_time = jm.time
 jm.time = clock
 
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 jm._last_scan = 0.0
 jm.auto_scan.value = True
 jm.scan_interval.value = 3
@@ -1106,7 +1200,7 @@ check("HOOKS tuple matches what was registered", list(jm.HOOKS) == hooks)
 # Firing a hook must count itself and announce the first call.
 reset_mod()
 jm._fires.clear()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 w, b = make_weapon("JAK_PS", (1, 2, 3, 4))
 jm.on_start_using(w, None, None, None)
 jm.on_start_using(w, None, None, None)
@@ -1139,7 +1233,7 @@ for action in ("dump", "status", "scan", "mine", "probe", "restore"):
 # answer "what is my damage now" instead.
 print("\n== masher mine reports the damage maths ==")
 reset_mod()
-jm.masher_frequency.value = 4
+jm.masher_chance.value = 100
 pc, pawn = make_player()
 rep_w = env.FakeObject(
     "OakWeapon", path="World.Report", BodyData="Body_JAK_PS"
