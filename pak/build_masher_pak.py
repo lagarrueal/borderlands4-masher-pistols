@@ -19,7 +19,8 @@ Usage:
     python pak/build_masher_pak.py              # build into build/
     python pak/build_masher_pak.py --install    # build and copy into Paks/
     python pak/build_masher_pak.py --uninstall  # remove it from Paks/
-    python pak/build_masher_pak.py --null       # control: repack inv4 unchanged
+    python pak/build_masher_pak.py --null       # control: repack inv4 unchanged (stored)
+    python pak/build_masher_pak.py --original   # control: the game's compressed file, byte for byte
 """
 
 from __future__ import annotations
@@ -284,6 +285,14 @@ def build() -> None:
     BUILD.mkdir(exist_ok=True)
     print("Building the Jakobs Masher pak against the installed game\n")
 
+    if ORIGINAL_BUILD:
+        # Control build: the game's own file, still Oodle-compressed exactly as
+        # shipped, in our pak. Separates "our stored container" from "any inv4
+        # supplied by a mod pak".
+        pak, carved = newest_copy(INV_FILE)
+        print(f"  ORIGINAL BUILD: packing {pak.name}'s compressed {INV_FILE} byte for byte")
+        package_file(carved)
+        return
     payload = extract_payload(INV_FILE, "inv4")
     if NULL_BUILD:
         # Control build: the game's own payload, repacked unchanged. If this
@@ -323,6 +332,20 @@ def package(patched: Path) -> None:
     root = BUILD / "_modroot"
     shutil.rmtree(root, ignore_errors=True)
     store(patched, root / "Engine" / "Content" / "_NCS" / INV_FILE)
+    pack_root(root)
+
+
+def package_file(ncs_file: Path) -> None:
+    """Pack an already-complete .ncs file (header included) unchanged."""
+    root = BUILD / "_modroot"
+    shutil.rmtree(root, ignore_errors=True)
+    dest = root / "Engine" / "Content" / "_NCS" / INV_FILE
+    dest.parent.mkdir(parents=True)
+    shutil.copy(ncs_file, dest)
+    pack_root(root)
+
+
+def pack_root(root: Path) -> None:
     pak = BUILD / f"{MOD_NAME}.pak"
     for ext in ("pak", "ucas", "utoc"):
         (BUILD / f"{MOD_NAME}.{ext}").unlink(missing_ok=True)
@@ -353,6 +376,7 @@ def uninstall() -> None:
 
 
 NULL_BUILD = "--null" in sys.argv
+ORIGINAL_BUILD = "--original" in sys.argv
 
 if __name__ == "__main__":
     if "--uninstall" in sys.argv:
