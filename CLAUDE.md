@@ -457,6 +457,31 @@ the item's stats container, which is separate work.
 `masher mine` reports the real maths instead: per-projectile damage, the count,
 the total per trigger pull, and the multiplier against the unmodified anchor.
 
+**Measured with `masher card`** (2026-09-29, a Masher equipped, a Masher on the
+ground with its HUD card up, a backpack card shown just before):
+
+- All 10 `WeaponBehavior_FireProjectile` objects sit under `OakWeapon` actors.
+  There is no separate card or item copy of the behaviour. A ground pickup
+  (`InventoryPickup`) comes with its own `OakWeapon`, which is why ground guns
+  already fire as Mashers.
+- Every item-side object carries only a handle:
+  `Item = {data: {InstanceId: 1011, Identity: {}}, State: {Quantity, Flags}}` on
+  the weapon and on the pickup, and `SourceItemHandle: {Handle: 909}` in the
+  pawn's `EquippedInventorySlots`. `Identity`, where parts, serial and stats
+  would live, has **no reflected members**.
+- `OakUIDataCollector_ItemCard`, `_Backpack` and `_ItemIcon` exist (outer: the
+  player controller) and expose **no properties**. The UI is Coherent (HTML),
+  fed natively, and no UFunction returns card rows or stat values.
+- There is no scriptable HUD message API. `PlayerController.ClientMessage` only
+  reaches the console.
+
+So the numbers on the card are built in native code from data that reflection
+cannot see. Reaching them would mean reverse-engineering native struct layouts
+and writing raw memory, which is fragile across patches and risks crashes. The
+first probe also capped fields before filtering, which cut the pawn off at
+"Inventory..."; that is fixed, but equipped-slot handles make a reflected stats
+container on the pawn unlikely.
+
 ### How the card decides (for reference)
 
 `Nexus-Data-ui_stat0.ncs` defines two damage rows whose `displaycondition` is a

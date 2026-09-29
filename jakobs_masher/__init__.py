@@ -1929,9 +1929,10 @@ def _probe_dump(out: _ProbeOut, obj: Any, indent: str, depth: int, seen: set[int
             return
         seen.add(address)
 
-    for name in _field_names(obj)[:CARD_PROBE_MAX_FIELDS]:
-        if only_matching and not CARD_FIELD_RE.search(name):
-            continue
+    # Filter before capping: capping first cut the pawn off at "Inventory...",
+    # alphabetically, and hid every field after it.
+    names = [n for n in _field_names(obj) if not only_matching or CARD_FIELD_RE.search(n)]
+    for name in names[:CARD_PROBE_MAX_FIELDS]:
         try:
             value = getattr(obj, name)
         except Exception as exc:
