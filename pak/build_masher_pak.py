@@ -341,13 +341,12 @@ def build() -> None:
 
 # Where the file goes in the pak.
 #
-# Replacing Engine/Content/_NCS/Nexus-Data-inv4.ncs wholesale made the game
-# hide class mods even when the file was the game's own, byte for byte. So by
-# default the mod uses Gearbox's hotfix path instead: the online patch pak
-# ships partial files there (OakGame/_PATCH/PAK/_NCS/Nexus-Data-challenge.ncs
-# holds 385 of challenge0's 2415 entries), merged entry by entry over the base
-# data. The base inv4 then stays untouched in its own pak.
-PATCH_ROUTE = "--replace" not in sys.argv
+# Default: replace Engine/Content/_NCS/Nexus-Data-inv4.ncs, built from the
+# real newest copy (see newest_copy). `--patch-route` instead puts the file
+# on Gearbox's hotfix path (OakGame/_PATCH/PAK/_NCS/), where the online patch
+# ships partial NCS files. Tested 2026-09-29: from a mod pak it has no effect
+# at all (no dmg x 6), so the game applies those only from its own patch pak.
+PATCH_ROUTE = "--patch-route" in sys.argv
 PATCH_FILE = "Nexus-Data-inv.ncs"  # hotfix files carry no chunk number
 
 
