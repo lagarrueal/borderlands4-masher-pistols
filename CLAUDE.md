@@ -1,16 +1,20 @@
 # BL4 Masher Pistols
 
-Adds BL3-style **Masher** revolvers: a fraction of Jakobs pistols fire multiple
-projectiles per shot, each for a fraction of card damage.
+Adds BL3-style **Masher** revolvers: every Jakobs pistol built with barrel 02
+fires 6 projectiles per shot at 0.4x damage each, with 3x spread, named
+"... Masher".
 
-> This is an **SDK Python mod**, not a `.pak` mod. The parent `../CLAUDE.md`'s
-> packaging rules (repak, stub `.utoc`, priority numbers, uncompressed `.ncs`)
-> do **not** apply here. Its `.ncs` *reading* notes do — that is how the design
-> was worked out.
-
-Unlike `bl4-xp-mod`, a game patch does not silently corrupt this mod. It either
-loads or it does not: the SDK itself breaks on patches (sigscan), and the hook
-paths are reflection names, which fail loudly.
+> **This is now a `.pak` mod** (`pak/build_masher_pak.py`). The parent
+> `../CLAUDE.md`'s packaging rules apply, and so does its warning: **a game
+> patch silently breaks it** until rebuilt, and building from a stale source
+> made the game delete items. The build always carves the newest copy of each
+> file from the installed paks.
+>
+> It began as an Oak2 SDK Python mod, which was removed on 2026-09-29 once the
+> pak worked. The code is in git history up to `f34ccdd`. The SDK sections
+> below are kept as research: they explain why a runtime edit never reaches the
+> item card, and they record the SDK facts learned along the way. Read "Pak
+> route, revisited" onward for the current design.
 
 ## Where weapon data actually lives
 
