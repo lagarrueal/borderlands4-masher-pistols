@@ -255,9 +255,15 @@ the key from `_weapon_cache` rather than recomputing it, for the same reason.
 An unreadable record is never overwritten (`_registry_unreadable`); guns are
 judged for the session only until `masher forget`.
 
-**Still unverified in game:** that parts read the same after a full restart.
-The log is overwritten per launch, so this needs a `masher mine` before and
-after one.
+**Measured across a full restart** (13:34 vs 13:55, 2026-09-29): the same two
+revolvers read the same parts and rolls (`23.43`, `37.89`) in the new session,
+and the verdicts were loaded from the record (`remembered verdicts loaded: 3`).
+The per-key heartbeat registered 66 keys and converted the equipped Masher on
+the first key press after loading.
+
+The record is **per install, not per save or character**: the key is the parts
+alone. A gun with identical parts gets the same verdict on every character,
+which is consistent with identical parts meaning the same gun.
 
 ### Ownership must never be cached as a no
 
