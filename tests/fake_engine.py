@@ -19,13 +19,23 @@ _NEXT_ADDR = [0x1000]
 RAW_KEYBINDS: dict[object, tuple] = {}
 
 
-def press_any_key() -> list:
-    """Deliver one key press to every any-key raw keybind."""
+# The compiled keybinds module shipped with the game rejects key=None, although
+# its stub documents it. True models a build where "any key" works.
+RAW_KEY_ACCEPTS_NONE = {"value": False}
+
+
+def press_key(name: str) -> list:
+    """Deliver one key press to every raw keybind that matches it."""
     results = []
     for key, event, callback in list(RAW_KEYBINDS.values()):
-        if key is None and event.name == "IE_Pressed":
+        if (key is None or key == name) and event.name == "IE_Pressed":
             results.append(callback())
     return results
+
+
+def press_any_key() -> list:
+    """A typical gameplay press: the left mouse button."""
+    return press_key("LeftMouseButton")
 
 
 # The local player controller, as mods_base.get_pc() would return it.
@@ -346,6 +356,9 @@ def install() -> None:
     def get_pc():
         return PLAYER["pc"]
 
+    import tempfile
+
+    mods_base.SETTINGS_DIR = __import__("pathlib").Path(tempfile.mkdtemp(prefix="masher_settings_"))
     mods_base.BoolOption = BoolOption
     mods_base.SliderOption = SliderOption
     mods_base.CoopSupport = CoopSupport
@@ -370,6 +383,11 @@ def install() -> None:
     keybinds_mod = types.ModuleType("keybinds.keybinds")
 
     def register_keybind(key, event, callback):
+        if key is None and not RAW_KEY_ACCEPTS_NONE["value"]:
+            raise TypeError(
+                "register_keybind(): incompatible function arguments. The following"
+                " argument types are supported: (key: str, event, callback)"
+            )
         handle = object()
         RAW_KEYBINDS[handle] = (key, event, callback)
         return handle

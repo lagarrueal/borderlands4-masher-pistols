@@ -81,6 +81,9 @@ def reset_mod() -> None:
     jm._shape_reported.clear()
     jm._drift_reported.clear()
     jm._not_ours_reported.clear()
+    jm._registry = None
+    jm._registry_unreadable = False
+    jm.registry_path().unlink(missing_ok=True)
     env.reset_world()
 
 
@@ -676,7 +679,7 @@ jm.maybe_scan("used an object", force=True)
 check("mid-pickup the gun is not converted", ground_b.ProjectilesPerShot.Value == 1)
 check(
     "the gun is remembered as a Jakobs revolver, but not as 'not ours'",
-    jm._weapon_cache.get(ground_w._get_address(), (None,) * 4)[3] is True,
+    jm._weapon_cache.get(ground_w._get_address(), (None,) * 5)[-1] is True,
     str(jm._weapon_cache.get(ground_w._get_address())),
 )
 
@@ -715,16 +718,40 @@ reset_mod()
 env.RAW_KEYBINDS.clear()
 jm.stop_input_heartbeat()
 
+# The shipped build rejects key=None: the heartbeat falls back to a key list.
 check("heartbeat starts on enable", jm.start_input_heartbeat() is True)
 registered = list(env.RAW_KEYBINDS.values())
 check(
-    "registered for any key, on press",
-    len(registered) == 1
-    and registered[0][0] is None
-    and registered[0][1].name == "IE_Pressed",
-    str([(k, e.name) for k, e, _ in registered]),
+    "without 'any key' it registers every heartbeat key, on press",
+    len(registered) == len(jm.HEARTBEAT_KEYS)
+    and all(e.name == "IE_Pressed" for _, e, _ in registered)
+    and {k for k, _, _ in registered} == set(jm.HEARTBEAT_KEYS),
+    str(len(registered)),
 )
-check("starting twice does not register twice", jm.start_input_heartbeat() and len(env.RAW_KEYBINDS) == 1)
+check(
+    "covers every letter, whatever the keyboard layout",
+    all(chr(c) in jm.HEARTBEAT_KEYS for c in range(ord("A"), ord("Z") + 1)),
+)
+check("and firing and gamepad", {"LeftMouseButton", "Gamepad_RightTrigger"} <= set(jm.HEARTBEAT_KEYS))
+check(
+    "starting twice does not register twice",
+    jm.start_input_heartbeat() and len(env.RAW_KEYBINDS) == len(jm.HEARTBEAT_KEYS),
+)
+jm.stop_input_heartbeat()
+check("stopping removes every key", len(env.RAW_KEYBINDS) == 0, str(len(env.RAW_KEYBINDS)))
+
+# A build that does accept "any key" gets exactly one registration.
+env.RAW_KEY_ACCEPTS_NONE["value"] = True
+jm.start_input_heartbeat()
+registered = list(env.RAW_KEYBINDS.values())
+check(
+    "with 'any key' it registers once",
+    len(registered) == 1 and registered[0][0] is None,
+    str([k for k, _, _ in registered]),
+)
+jm.stop_input_heartbeat()
+env.RAW_KEY_ACCEPTS_NONE["value"] = False
+jm.start_input_heartbeat()
 
 class _HeartbeatClock:
     def __init__(self):
@@ -790,7 +817,7 @@ jm.stop_input_heartbeat()
 check("heartbeat stops on disable", len(env.RAW_KEYBINDS) == 0, str(len(env.RAW_KEYBINDS)))
 
 jm.on_mod_enabled()
-check("enabling the mod starts it", len(env.RAW_KEYBINDS) == 1)
+check("enabling the mod starts it", len(env.RAW_KEYBINDS) == len(jm.HEARTBEAT_KEYS))
 jm.on_mod_disabled()
 check("disabling the mod stops it", len(env.RAW_KEYBINDS) == 0)
 
@@ -934,7 +961,7 @@ check("cached path does not rescan the object list", calls["n"] == 0, f"{calls['
 jm.unrealsdk.find_all = real_find_all
 
 # A garbage-collected behaviour forces a rescan rather than crashing.
-path, pointers, roll, jakobs = jm._weapon_cache[w._get_address()]
+path, pointers, key, roll, jakobs = jm._weapon_cache[w._get_address()]
 pointers[0].kill()
 try:
     jm.process_weapon(w)
@@ -943,53 +970,140 @@ except Exception as exc:  # noqa: BLE001
     check("survives a collected behaviour", False, repr(exc))
 
 # --------------------------------------------------------------------------- #
-# The old frequency slider cached the verdict, so a gun already seen kept its
-# old answer until re-equipped, and "0 disables" did not disable anything.
-print("\n== changing the chance applies to guns already seen ==")
+# A gun is judged once, the first time it is in your hands, and the verdict is
+# written down: chance changes only affect guns found afterwards, and a restart
+# cannot flip a gun you own.
+print("\n== a gun is judged once, and remembered ==")
 reset_mod()
 jm.masher_chance.value = 50
-pool = []
-for i in range(40):
-    cw, cb = make_weapon("JAK_PS", (i, i * 3 % 11, 7, i % 5))
-    pool.append((cw, cb))
-    jm.process_weapon(cw)
+POOL_PARTS = [(i, i * 3 % 11, 7, i % 5) for i in range(40)]
 
 
-def mashers_now():
-    return sum(cb.ProjectilesPerShot == 6 for _, cb in pool)
+def make_pool():
+    made = []
+    for parts in POOL_PARTS:
+        made.append(make_weapon("JAK_PS", parts))
+    for cw, _ in made:
+        jm.process_weapon(cw)
+    return made
 
 
-at_half = mashers_now()
-check("some but not all convert at 50%", 0 < at_half < len(pool), f"{at_half}/{len(pool)}")
+def mashers_in(pool):
+    return [cb.ProjectilesPerShot == 6 for _, cb in pool]
+
+
+pool = make_pool()
+at_half = mashers_in(pool)
+check("some but not all convert at 50%", 0 < sum(at_half) < len(pool), f"{sum(at_half)}/{len(pool)}")
 check(
-    "each converted gun is one whose roll qualifies",
-    all((cb.ProjectilesPerShot == 6) == jm.cached_masher(cw) for cw, cb in pool),
+    "each verdict matches the roll at the time",
+    all(m == jm.rolls_masher(cw, [cb]) for (cw, cb), m in zip(pool, at_half)),
 )
 
+saved = __import__("json").loads(jm.registry_path().read_text(encoding="utf-8"))
+check("every gun is written down", len(saved["guns"]) == len(set(POOL_PARTS)), str(len(saved["guns"])))
+entry = saved["guns"]["parts:" + ",".join(map(str, POOL_PARTS[0]))]
+check(
+    "with its verdict, roll and the chance it was judged at",
+    set(entry) == {"masher", "roll", "chance", "decided"} and entry["chance"] == 50,
+    str(entry),
+)
+
+for chance in (0, 100, 17):
+    jm.masher_chance.value = chance
+    for cw, _ in pool:
+        jm.process_weapon(cw)
+    check(
+        f"moving the chance to {chance}% changes no gun already judged",
+        mashers_in(pool) == at_half,
+    )
+
+# A restart: nothing in memory, the same guns come back as new actors.
+jm.restore_all()
+jm._registry = None
 jm.masher_chance.value = 0
-for cw, _ in pool:
-    jm.process_weapon(cw)
-check("0% turns every masher back into a revolver", mashers_now() == 0, str(mashers_now()))
-check(
-    "with the original numbers",
-    all(cb.Damage == 100.0 and cb.Spread == 1.0 for _, cb in pool),
-)
-check("and drops their bookkeeping", not jm._touched, str(len(jm._touched)))
+pool = make_pool()
+check("after a restart every gun keeps its verdict", mashers_in(pool) == at_half)
 
+# New guns are judged at the chance in force when they are found.
 jm.masher_chance.value = 100
-for cw, _ in pool:
-    jm.process_weapon(cw)
-check("100% converts all of them, without re-identifying", mashers_now() == len(pool))
+fresh_w, fresh_b = make_weapon("JAK_PS", (90, 91, 92, 93))
+jm.process_weapon(fresh_w)
+check("a new gun found at 100% is a Masher", fresh_b.ProjectilesPerShot == 6)
+jm.masher_chance.value = 0
+plain_w, plain_b = make_weapon("JAK_PS", (80, 81, 82, 83))
+jm.process_weapon(plain_w)
+check("a new gun found at 0% is not", plain_b.ProjectilesPerShot == 1)
+jm.process_weapon(fresh_w)
+check("and the earlier one stays a Masher", fresh_b.ProjectilesPerShot == 6)
+
+# Identical parts are the same gun, as a BL3 Masher barrel would be.
+twin_w, twin_b = make_weapon("JAK_PS", (90, 91, 92, 93))
+jm.process_weapon(twin_w)
+check("a gun with identical parts shares the verdict", twin_b.ProjectilesPerShot == 6)
+
+# The per-pass path is a lookup, not a re-judgement.
+judged = {"n": 0}
+real_is_masher_roll = jm.is_masher_roll
+jm.is_masher_roll = lambda roll: judged.__setitem__("n", judged["n"] + 1) or real_is_masher_roll(roll)
+for _ in range(10):
+    for cw, _ in pool:
+        jm.process_weapon(cw)
+jm.is_masher_roll = real_is_masher_roll
+check("remembered guns are never compared to the chance again", judged["n"] == 0, str(judged["n"]))
+
+# 'masher forget' judges everything again at the current chance.
+jm.masher_chance.value = 0
+buf_f = __import__("io").StringIO()
+with __import__("contextlib").redirect_stdout(buf_f):
+    env.sys.modules["mods_base"].REGISTERED["commands"][0]("forget")
+check("forget re-judges held guns at the current chance", not any(mashers_in(pool)), str(sum(mashers_in(pool))))
+check("and says how many it forgot", "forgot" in buf_f.getvalue(), buf_f.getvalue()[-200:])
+saved = __import__("json").loads(jm.registry_path().read_text(encoding="utf-8"))
 check(
-    "anchored on the restored values, not compounded",
-    all(abs(cb.Damage - 40.0) < 1e-6 for _, cb in pool),
-    str(sorted({round(cb.Damage, 3) for _, cb in pool})),
+    "the record now holds the new verdicts",
+    saved["guns"] and not any(e["masher"] for e in saved["guns"].values()),
+    str(len(saved["guns"])),
 )
 
-jm.masher_chance.value = 50
-for cw, _ in pool:
-    jm.process_weapon(cw)
-check("back to 50%, the same guns as before", mashers_now() == at_half, f"{mashers_now()} vs {at_half}")
+# A record that cannot be read is never overwritten.
+reset_mod()
+jm.registry_path().write_text("{not json", encoding="utf-8")
+jm.masher_chance.value = 100
+bad_w, bad_b = make_weapon("JAK_PS", (5, 5, 5, 5))
+buf_b = __import__("io").StringIO()
+with __import__("contextlib").redirect_stdout(buf_b):
+    jm.process_weapon(bad_w)
+check("an unreadable record still lets guns convert", bad_b.ProjectilesPerShot == 6)
+check("it is reported", "could not read" in buf_b.getvalue(), buf_b.getvalue()[-200:])
+check(
+    "and left untouched on disk",
+    jm.registry_path().read_text(encoding="utf-8") == "{not json",
+)
+
+# Fingerprint identities are judged for the session but never written: buffs
+# can move the stats they come from, so the record could not find them again.
+reset_mod()
+jm.masher_chance.value = 100
+fp_w = env.FakeObject("OakWeapon", path="World.Fp_JAK_PS", BodyData="Body_JAK_PS")
+fp_w._props["GetPartValue"] = env.BoundFunction(lambda s: (_ for _ in ()).throw(RuntimeError()))
+fp_b = env.FakeObject(
+    "WeaponBehavior_FireProjectile",
+    path="World.Fp_JAK_PS.Fire",
+    outer=fp_w,
+    ProjectilesPerShot=1,
+    Damage=100.0,
+    Spread=1.0,
+    FireRate=2.5,
+)
+jm.process_weapon(fp_w)
+check("a fingerprinted gun still converts", fp_b.ProjectilesPerShot == 6)
+check(
+    "but is not written down",
+    not jm.registry_path().exists()
+    or not __import__("json").loads(jm.registry_path().read_text(encoding="utf-8"))["guns"],
+)
+check("it is remembered for the session", jm.cached_masher(fp_w) is True)
 
 # Turning 'Player Weapons Only' on reverts revolvers that are not yours.
 reset_mod()
@@ -1017,11 +1131,15 @@ check("it opens the fast window instead", jm._fast_until > jm.time.monotonic())
 jm.scan_all = real_scan_all3
 jm._fast_until = 0.0
 check(
-    "the chance and knob options all carry the callback",
+    "the knob options carry the callback",
     all(
         o.on_change_while_enabled is jm._on_setting_change
-        for o in (jm.masher_chance, jm.projectiles, jm.damage_scale, jm.spread_scale, jm.player_weapons_only)
+        for o in (jm.projectiles, jm.damage_scale, jm.spread_scale, jm.player_weapons_only)
     ),
+)
+check(
+    "the chance does not - it only affects guns found afterwards",
+    jm.masher_chance.on_change_while_enabled is None,
 )
 
 # --------------------------------------------------------------------------- #
@@ -1221,7 +1339,7 @@ check("scan keybind registered", len(kbs) == 1 and kbs[0].name == "Scan Weapons 
 
 cmds = env.sys.modules["mods_base"].REGISTERED["commands"]
 check("masher command registered", len(cmds) == 1 and cmds[0].cmd == "masher")
-for action in ("dump", "status", "scan", "mine", "probe", "restore"):
+for action in ("dump", "status", "scan", "mine", "probe", "restore", "forget"):
     try:
         cmds[0](action)
         check(f"'masher {action}' runs", True)

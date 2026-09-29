@@ -203,9 +203,15 @@ next session, two of those never fired either:
 says `hook OK`, which is registration, not a call. Bound is not fired.
 
 **The heartbeat is input.** The SDK detours `UGbxEnhancedPlayerInput::InputKey`
-(visible in `unrealsdk.log`), which is how keybinds work at all, and the native
-`keybinds.keybinds.register_keybind` accepts `None` as the key to mean *any*
-key. Registered on `IE_Pressed` only — axis events (mouse look) would be far too
+(visible in `unrealsdk.log`), which is how keybinds work at all.
+`keybinds.pyi` documents `None` as the key meaning *any* key, **but the
+compiled `keybinds.pyd` shipped here rejects it**. Measured:
+`register_keybind(): incompatible function arguments ... (key: str, event:
+SupportsInt | None, callback)`, so the heartbeat never started and loaded guns
+waited 25s for a pickup event to convert. `start_input_heartbeat()` now tries
+`None` first and falls back to one registration per `HEARTBEAT_KEYS` entry: all
+26 letters (AZERTY vs QWERTY), the number row, mouse buttons and scroll,
+modifiers, and the gamepad buttons. Registered on `IE_Pressed` only — axis events (mouse look) would be far too
 frequent — it fires on moving, firing, swapping, and pressing E to pick up:
 exactly while you are playing. `mods_base`'s `@keybind` cannot do this; its
 `enable_keybind` returns early when `key is None`, so the module is called
@@ -220,31 +226,38 @@ heartbeat may sweep every 0.5s — because the weapon actor and its ownership
 arrive a moment *after* the event that announced them. A sweep that raises is
 contained rather than escaping into the engine.
 
-### The roll is cached, the verdict is not
+### Verdicts are judged once and written down
 
-Version 1.0 cached `is_masher` per weapon and rolled `(hash & 3) < frequency`.
-Two consequences, both contradicting the option's own description: a gun
-already seen kept its answer when the frequency changed (until a swap respawned
-it as a new actor), and frequency 0 disabled nothing that was already converted.
-The description also claimed that changing the setting "reshuffles" which guns
-qualify, which was wrong: a threshold on a fixed hash is nested.
+History, because it went through three designs in a day:
 
-Now `masher_roll()` places each gun at `hash % 10000 / 100` on 0..100, the cache
-stores that roll (`(path, pointers, roll, is_jakobs)`), and `process_weapon`
-re-derives `roll < Masher Chance` every pass. A gun that stops qualifying,
-because the chance was lowered or because it is not yours once `Player Weapons
-Only` is on, is put back by `restore_behaviour()`, which also drops its
-bookkeeping so a later re-conversion anchors on the restored numbers. 100 also
-converts a gun with no identity to roll, so "every Jakobs pistol" is literal.
+1. **1.0** cached `is_masher` per weapon *actor*, rolled `(hash & 3) <
+   frequency`. Frequency changes silently did nothing to seen guns, "0
+   disables" disabled nothing, and the description wrongly said changes
+   "reshuffle" guns (a threshold on a fixed hash is nested).
+2. **1.1** cached the roll and re-compared it to `Masher Chance` every pass,
+   so changes applied live, reverting guns included. The user did not want
+   guns re-checked against the config: a gun should be decided once.
+3. **Now:** `decide(key, roll)` judges a gun the first time it is eligible
+   (ownership passes) and records `{masher, roll, chance, decided}` in
+   `SETTINGS_DIR/jakobs_masher_guns.json`. Every later pass is a dict lookup.
+   `Masher Chance` therefore only affects guns found afterwards, and it no
+   longer has an `on_change` callback. `masher forget` clears the record,
+   reverts, and re-sweeps.
 
-mods_base's `on_change_while_enabled` fires **before** the new value is stored,
-so the callback does not sweep, because that would evaluate the old value. It
-opens the fast window, and the next key press sweeps with the new one.
+Keys are `parts:<GetPartValue slots 0..15>`. **Measured**, 2026-09-29: two
+different JAK_PS read `1,0,2,2,0,0,0,0,5,0,...` and `3,3,1,1,0,...`, each
+identical across five `masher mine` calls. Identical parts share a verdict,
+which is BL3-faithful (a Masher barrel). Stat-fingerprint keys (the fallback
+when `GetPartValue` fails) are prefixed `session:` and never written, because
+buffs and the Masher's own spread move the stats they hash. `masher mine` reads
+the key from `_weapon_cache` rather than recomputing it, for the same reason.
 
-**Unverified in game:** whether `GetPartValue` actually differs between two
-revolvers. At 4/4 every gun converted regardless, so the spread has never been
-exercised live. `masher mine` now prints `parts = ...` for each Jakobs pistol
-to settle it.
+An unreadable record is never overwritten (`_registry_unreadable`); guns are
+judged for the session only until `masher forget`.
+
+**Still unverified in game:** that parts read the same after a full restart.
+The log is overwritten per launch, so this needs a `masher mine` before and
+after one.
 
 ### Ownership must never be cached as a no
 

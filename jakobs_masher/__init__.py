@@ -19,9 +19,12 @@ revolver is a Masher in every session or in none.
 
 from __future__ import annotations
 
+import datetime
+import json
 import re
 import time
 import traceback
+from pathlib import Path
 from typing import Any
 
 import unrealsdk
@@ -39,7 +42,7 @@ from mods_base import (
 from unrealsdk.hooks import Type
 from unrealsdk.unreal import BoundFunction, UObject, WeakPointer, WrappedStruct
 
-__version__ = "1.1"
+__version__ = "1.2"
 __author__ = "Claude"
 
 # --------------------------------------------------------------------------- #
@@ -141,14 +144,12 @@ masher_chance = SliderOption(
     100,
     display_name="Masher Chance (%)",
     description=(
-        "What share of Jakobs revolvers are Mashers - 17 is about one in six."
-        " Each gun's answer comes from its own parts, so a given revolver keeps"
-        " it in every session. Raising this only ever adds Mashers and"
-        " lowering it only removes them; no gun flips the other way. Guns you"
-        " are holding update straight away: 0 turns every Masher back into a"
-        " plain revolver, 100 converts every Jakobs pistol."
+        "What share of newly found Jakobs revolvers are Mashers - 17 is about"
+        " one in six. Each gun is judged once, the first time it is in your"
+        " hands, and the verdict is remembered across restarts. Changing this"
+        " only affects guns you find afterwards. 'masher forget' re-judges"
+        " everything at the current chance."
     ),
-    on_change_while_enabled=_on_setting_change,
 )
 
 player_weapons_only = BoolOption(
@@ -571,15 +572,18 @@ def masher_roll(weapon: UObject, behaviours: list[UObject]) -> float | None:
     live weapon to apply it to.
 
     The roll is a position, not a verdict: a gun is a Masher when its roll is
-    below `Masher Chance`. That makes the setting nested - raising it only adds
-    guns, lowering it only removes them - and lets a cached roll answer a new
-    setting without recomputing anything.
+    below `Masher Chance` at the moment it is first judged (see `decide`).
 
     (The part slots are read as an opaque list - the game does not tell us
     which index is the barrel - so this is a hash over the whole roll rather
     than a literal barrel-variant check.)
     """
     _source, identity = roll_identity(weapon, behaviours)
+    return roll_of(identity)
+
+
+def roll_of(identity: tuple[int, ...]) -> float | None:
+    """The 0..100 roll for an identity tuple. None for an empty one."""
     if not identity:
         return None
 
@@ -603,8 +607,149 @@ def is_masher_roll(roll: float | None) -> bool:
 
 
 def rolls_masher(weapon: UObject, behaviours: list[UObject]) -> bool:
-    """Is this particular revolver a Masher, at the current setting?"""
+    """Would this revolver be a Masher if it were judged now?"""
     return is_masher_roll(masher_roll(weapon, behaviours))
+
+
+# --------------------------------------------------------------------------- #
+# Remembering the verdict
+#
+# A gun is judged once, the first time the mod sees it in your hands, against
+# the chance at that moment, and the verdict is written down. Later changes to
+# `Masher Chance` only affect guns found afterwards, and neither a restart nor
+# a mod update can flip a gun you already own. Nothing goes into the game's
+# save: this is the mod's own file, beside its settings.
+#
+# Guns are known by their part values, the numbers the item serial stores.
+# Two revolvers built from identical parts are the same gun as far as anything
+# here can tell, so they share a verdict - the way a BL3 Masher barrel made
+# every gun carrying it a Masher.
+# --------------------------------------------------------------------------- #
+
+try:
+    from mods_base import SETTINGS_DIR as _SETTINGS_DIR
+except Exception:  # pragma: no cover - depends on the mods_base build
+    _SETTINGS_DIR = Path(__file__).resolve().parent.parent / "settings"
+
+REGISTRY_FILE_NAME = "jakobs_masher_guns.json"
+REGISTRY_VERSION = 1
+
+# Keys with this prefix are judged once per session but never written: they
+# come from the stat fingerprint, which temporary buffs can move, so a
+# remembered verdict could not be found again reliably.
+SESSION_KEY_PREFIX = "session:"
+
+# Key -> {"masher": bool, "roll": float | None, "chance": int, "decided": str}.
+# None until first loaded from disk.
+_registry: dict[str, dict[str, Any]] | None = None
+
+# Set when the file exists but cannot be read: it is then never overwritten,
+# so a hand-edit gone wrong loses nothing. `masher forget` clears it.
+_registry_unreadable = False
+
+
+def registry_path() -> Path:
+    return Path(_SETTINGS_DIR) / REGISTRY_FILE_NAME
+
+
+def load_registry() -> dict[str, dict[str, Any]]:
+    global _registry, _registry_unreadable
+    if _registry is not None:
+        return _registry
+    _registry = {}
+    path = registry_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        guns = data["guns"]
+        if not isinstance(guns, dict):
+            raise ValueError("'guns' is not an object")
+    except FileNotFoundError:
+        return _registry
+    except Exception as exc:
+        _registry_unreadable = True
+        log(
+            f"could not read {path} ({exc}). It will not be overwritten;"
+            " guns are judged for this session only. 'masher forget' resets it."
+        )
+        return _registry
+    for key, entry in guns.items():
+        if isinstance(entry, dict) and isinstance(entry.get("masher"), bool):
+            _registry[key] = entry
+    debug(f"remembered verdicts loaded: {len(_registry)}")
+    return _registry
+
+
+def save_registry() -> None:
+    if _registry is None or _registry_unreadable:
+        return
+    path = registry_path()
+    persisted = {k: v for k, v in _registry.items() if not k.startswith(SESSION_KEY_PREFIX)}
+    body = json.dumps({"version": REGISTRY_VERSION, "guns": persisted}, indent=1, sort_keys=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".tmp")
+        temp.write_text(body, encoding="utf-8")
+        temp.replace(path)
+    except Exception as exc:
+        log(f"could not save {path}: {exc}")
+
+
+def gun_key(source: str, identity: tuple[int, ...]) -> str | None:
+    """How a gun is known in the record. None if it has no identity at all."""
+    if not identity:
+        return None
+    text = ",".join(map(str, identity))
+    if source == "parts":
+        return f"parts:{text}"
+    return f"{SESSION_KEY_PREFIX}{source}:{text}"
+
+
+def decide(key: str | None, roll: float | None) -> tuple[bool, bool]:
+    """Is this gun a Masher? Returns (verdict, judged just now).
+
+    The first call for a key judges it against the current chance and records
+    the answer; every later call - this session or any other - returns that
+    record untouched.
+    """
+    registry = load_registry()
+    if key is not None:
+        entry = registry.get(key)
+        if entry is not None:
+            return bool(entry["masher"]), False
+    masher = is_masher_roll(roll)
+    if key is not None:
+        registry[key] = {
+            "masher": masher,
+            "roll": None if roll is None else round(roll, 2),
+            "chance": int(masher_chance.value),
+            "decided": datetime.date.today().isoformat(),
+        }
+        if not key.startswith(SESSION_KEY_PREFIX):
+            save_registry()
+    return masher, True
+
+
+def forget_all() -> int:
+    """Drop every remembered verdict. Returns how many were written down."""
+    global _registry_unreadable
+    registry = load_registry()
+    count = sum(1 for k in registry if not k.startswith(SESSION_KEY_PREFIX))
+    registry.clear()
+    _registry_unreadable = False
+    save_registry()
+    return count
+
+
+def describe_decision(key: str | None, roll: float | None) -> str:
+    chance = int(masher_chance.value)
+    rolled = "no roll" if roll is None else f"roll {roll:.2f}"
+    entry = load_registry().get(key) if key is not None else None
+    if entry is None:
+        would = "Masher" if is_masher_roll(roll) else "plain"
+        return f"{rolled}, not judged yet (would be {would} at {chance}%)"
+    verdict = "Masher" if entry["masher"] else "plain"
+    scope = " - this session only" if key.startswith(SESSION_KEY_PREFIX) else ""
+    return f"{rolled}, judged {verdict} at {entry['chance']}% on {entry['decided']}{scope}"
 
 
 # --------------------------------------------------------------------------- #
@@ -616,20 +761,22 @@ def rolls_masher(weapon: UObject, behaviours: list[UObject]) -> bool:
 # without us either fighting it or compounding our own multiplier.
 _touched: dict[int, dict[str, Any]] = {}
 
-# Weapon address -> (path name, behaviour pointers, roll, is a Jakobs pistol).
-# The path name guards against the engine recycling an address for a different
-# weapon. The roll is cached rather than the verdict, so a change to `Masher
-# Chance` is answered on the next pass without re-identifying anything.
-_weapon_cache: dict[int, tuple[str, list[WeakPointer], float | None, bool]] = {}
+# Weapon address -> (path name, behaviour pointers, record key, roll, is a
+# Jakobs pistol). The path name guards against the engine recycling an address
+# for a different weapon.
+_weapon_cache: dict[int, tuple[str, list[WeakPointer], str | None, float | None, bool]] = {}
 
 
 def cached_masher(weapon: UObject) -> bool | None:
-    """Is this weapon a Masher under the current setting? None if never seen."""
+    """The remembered verdict for this weapon. None if not judged yet."""
     cached = _weapon_cache.get(weapon._get_address())
     if cached is None:
         return None
-    _path, _pointers, roll, jakobs = cached
-    return jakobs and is_masher_roll(roll)
+    _path, _pointers, key, _roll, jakobs = cached
+    if not jakobs:
+        return False
+    entry = load_registry().get(key) if key is not None else None
+    return None if entry is None else bool(entry["masher"])
 
 
 # Which property carries each knob is not obvious, and neither is its type.
@@ -1109,9 +1256,8 @@ def process_weapon(weapon: UObject, known: list[UObject] | None = None) -> None:
     cached = _weapon_cache.get(address)
 
     behaviours: list[UObject] | None = None
-    first_sight = False
     if cached is not None and cached[0] == path:
-        _, pointers, roll, jakobs = cached
+        _, pointers, key, roll, jakobs = cached
         if not jakobs:
             return
         behaviours = [b for b in (p() for p in pointers) if b is not None]
@@ -1120,20 +1266,29 @@ def process_weapon(weapon: UObject, known: list[UObject] | None = None) -> None:
 
     if behaviours is None:
         if not is_jakobs_pistol(weapon):
-            _weapon_cache[address] = (path, [], None, False)
+            _weapon_cache[address] = (path, [], None, None, False)
             return
         behaviours = known if known is not None else fire_behaviours_of(weapon)
         if not behaviours:
             debug(f"no {FIRE_BEHAVIOUR_CLASS} found under {path}")
             return
-        roll = masher_roll(weapon, behaviours)
-        _weapon_cache[address] = (path, [WeakPointer(b) for b in behaviours], roll, True)
-        first_sight = True
+        source, identity = roll_identity(weapon, behaviours)
+        key = gun_key(source, identity)
+        roll = roll_of(identity)
+        _weapon_cache[address] = (path, [WeakPointer(b) for b in behaviours], key, roll, True)
 
-    # The verdict is re-derived every pass from the cached roll, so moving
-    # `Masher Chance` converts or reverts guns already seen - including
-    # setting it to 0, which turns every Masher back into a revolver.
-    wanted = is_masher_roll(roll) and _eligible_owner(weapon, address, path)
+    # Ownership first: a gun is only judged once it is in your hands (or, with
+    # 'Player Weapons Only' off, in anyone's), so enemy guns and guns
+    # mid-pickup never use up a verdict.
+    if _eligible_owner(weapon, address, path):
+        wanted, judged_now = decide(key, roll)
+        if judged_now:
+            log(
+                f"judged {path}: {'Masher' if wanted else 'plain revolver'}"
+                f" ({describe_decision(key, roll)})"
+            )
+    else:
+        wanted = False
     converted = any(b._get_address() in _touched for b in behaviours)
 
     if wanted:
@@ -1143,25 +1298,16 @@ def process_weapon(weapon: UObject, known: list[UObject] | None = None) -> None:
         if not converted:
             log(
                 f"Masher: {path} -> {int(projectiles.value)} projectiles"
-                f" (roll {_describe_roll(roll)}; {', '.join(applied) or 'nothing applied'})"
+                f" ({', '.join(applied) or 'nothing applied'})"
             )
         return
 
     if converted:
+        # No longer eligible (not yours once 'Player Weapons Only' is on), or
+        # its verdict was forgotten and re-judged plain.
         for behaviour in behaviours:
             restore_behaviour(behaviour)
-        log(f"no longer a Masher, restored: {path} (roll {_describe_roll(roll)})")
-        return
-
-    if first_sight:
-        debug(f"{path} is a plain Jakobs revolver (roll {_describe_roll(roll)})")
-
-
-def _describe_roll(roll: float | None) -> str:
-    chance = int(masher_chance.value)
-    if roll is None:
-        return f"none - no identity, chance {chance}%"
-    return f"{roll:.2f} vs chance {chance}%"
+        log(f"no longer a Masher, restored: {path}")
 
 
 def _eligible_owner(weapon: UObject, address: int, path: str) -> bool:
@@ -1396,10 +1542,13 @@ def _scan_and_follow_up(reason: str) -> None:
 # `PostEventInWorld` and `OnEquipSlotsReadyForInventory` bound and never fired,
 # so the audio "heartbeat" never beat. What demonstrably does reach Python on
 # this install is input - the SDK detours UGbxEnhancedPlayerInput::InputKey,
-# which is how keybinds work at all. The keybinds module accepts `None` as the
-# key to mean "any key", so moving, firing, swapping and pressing E to pick
-# something up all drive the sweep. It is throttled like everything else and
-# never blocks the key.
+# which is how keybinds work at all. The keybinds stub documents `None` as the
+# key meaning "any key", but the compiled module shipped with this install
+# rejects it (measured: "incompatible function arguments ... key: str"). So
+# `None` is tried first, for builds where it works, and otherwise the heartbeat
+# registers one raw keybind per key in HEARTBEAT_KEYS. Moving, firing,
+# swapping and pressing E all drive the sweep. It is throttled like everything
+# else and never blocks the key.
 # --------------------------------------------------------------------------- #
 
 try:
@@ -1411,8 +1560,28 @@ except Exception:  # pragma: no cover - depends on the SDK build
     _register_raw_key = None
     _deregister_raw_key = None
 
-_input_handle = None
+# Handles of the registered raw keybinds; empty while the heartbeat is off.
+_input_handles: list[Any] = []
 INPUT_HEARTBEAT = "any key press"
+
+# The fallback when "any key" is not accepted: every key that plausibly gets
+# pressed while playing, keyboard and mouse and gamepad. All 26 letters rather
+# than a movement set, because the letter a key produces depends on the
+# keyboard layout (ZQSD on AZERTY is WASD on QWERTY). Names are Unreal FKeys.
+HEARTBEAT_KEYS: tuple[str, ...] = (
+    *(chr(c) for c in range(ord("A"), ord("Z") + 1)),
+    "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Zero",
+    "SpaceBar", "LeftShift", "LeftControl", "LeftAlt", "Tab", "Escape", "Enter",
+    "LeftMouseButton", "RightMouseButton", "MiddleMouseButton",
+    "ThumbMouseButton", "ThumbMouseButton2", "MouseScrollUp", "MouseScrollDown",
+    "Gamepad_FaceButton_Bottom", "Gamepad_FaceButton_Right",
+    "Gamepad_FaceButton_Left", "Gamepad_FaceButton_Top",
+    "Gamepad_LeftShoulder", "Gamepad_RightShoulder",
+    "Gamepad_LeftTrigger", "Gamepad_RightTrigger",
+    "Gamepad_LeftThumbstick", "Gamepad_RightThumbstick",
+    "Gamepad_DPad_Up", "Gamepad_DPad_Down", "Gamepad_DPad_Left", "Gamepad_DPad_Right",
+    "Gamepad_Special_Left", "Gamepad_Special_Right",
+)
 
 
 def _on_any_key() -> None:
@@ -1422,31 +1591,42 @@ def _on_any_key() -> None:
 
 
 def start_input_heartbeat() -> bool:
-    global _input_handle
-    if _input_handle is not None:
+    if _input_handles:
         return True
     if _register_raw_key is None:
         log("no raw keybind support in this SDK build - heartbeat unavailable")
         return False
+
     try:
-        _input_handle = _register_raw_key(None, EInputEvent.IE_Pressed, _on_any_key)
-    except Exception as exc:
-        log(f"could not start the input heartbeat: {exc}")
-        _input_handle = None
+        _input_handles.append(_register_raw_key(None, EInputEvent.IE_Pressed, _on_any_key))
+        debug("input heartbeat: any key")
+        return True
+    except Exception:
+        pass  # this build wants a real key name - register them one by one
+
+    failed: list[str] = []
+    for key in HEARTBEAT_KEYS:
+        try:
+            _input_handles.append(_register_raw_key(key, EInputEvent.IE_Pressed, _on_any_key))
+        except Exception:
+            failed.append(key)
+    if not _input_handles:
+        log(f"could not start the input heartbeat: no key would register ({', '.join(failed[:5])}...)")
         return False
+    debug(f"input heartbeat: {len(_input_handles)} keys")
+    if failed:
+        log(f"input heartbeat: these keys would not register: {', '.join(failed)}")
     return True
 
 
 def stop_input_heartbeat() -> None:
-    global _input_handle
-    if _input_handle is None or _deregister_raw_key is None:
-        _input_handle = None
-        return
-    try:
-        _deregister_raw_key(_input_handle)
-    except Exception:
-        pass
-    _input_handle = None
+    if _deregister_raw_key is not None:
+        for handle in _input_handles:
+            try:
+                _deregister_raw_key(handle)
+            except Exception:
+                pass
+    _input_handles.clear()
 
 
 HOOKS = (
@@ -1474,7 +1654,9 @@ def on_mod_enabled() -> None:
 
     log(f"enabled - {int(projectiles.value)} projectiles at "
         f"{float(damage_scale.value):.2f}x damage, "
-        f"{int(masher_chance.value)}% of Jakobs revolvers")
+        f"{int(masher_chance.value)}% of newly found Jakobs revolvers,"
+        f" {sum(1 for k in load_registry() if not k.startswith(SESSION_KEY_PREFIX))}"
+        " guns remembered")
     log(f"hooks bound: {', '.join(bound) if bound else 'NONE'}")
     if unbound:
         log(f"hooks NOT bound: {', '.join(unbound)}")
@@ -1528,18 +1710,20 @@ def masher_command(args: Any) -> None:
                     f"  fired={_fires.get(short, 0)}"
                 )
         log(
-            f"  {INPUT_HEARTBEAT:<34} bound={_input_handle is not None}"
+            f"  {INPUT_HEARTBEAT:<34} bound={len(_input_handles)} key(s)"
             f"  fired={_fires.get(INPUT_HEARTBEAT, 0)}"
         )
         log(f"weapons seen: {len(_weapon_cache)}, behaviours modified: {len(_touched)}")
-        for path, pointers, roll, jakobs in _weapon_cache.values():
+        for path, pointers, key, roll, jakobs in _weapon_cache.values():
             if not jakobs:
                 log(f"  not a Jakobs pistol  {path}")
                 continue
-            log(
-                f"  masher={is_masher_roll(roll)}  roll={_describe_roll(roll)}"
-                f"  behaviours={len(pointers)}  {path}"
-            )
+            log(f"  {describe_decision(key, roll)}  behaviours={len(pointers)}  {path}")
+        remembered = sum(1 for k in load_registry() if not k.startswith(SESSION_KEY_PREFIX))
+        log(
+            f"remembered verdicts: {remembered} in {registry_path()}"
+            + ("  (UNREADABLE - not being saved)" if _registry_unreadable else "")
+        )
         return
 
     if args.action == "scan":
@@ -1580,7 +1764,14 @@ def masher_command(args: Any) -> None:
                 # rolls alike and the chance is all-or-nothing.
                 source, identity = roll_identity(weapon, behaviours)
                 log(f"      {source} = {', '.join(map(str, identity)) or 'NONE'}")
-                log(f"      roll {_describe_roll(masher_roll(weapon, behaviours))}")
+                # The key as judged, from the cache: a stat fingerprint read
+                # now would include the Masher's own widened spread.
+                cached = _weapon_cache.get(weapon._get_address())
+                if cached is not None and cached[4]:
+                    key, roll = cached[2], cached[3]
+                else:
+                    key, roll = gun_key(source, identity), roll_of(identity)
+                log(f"      {describe_decision(key, roll)}")
 
             # The item card is built from the item's own stats container, not
             # from the live behaviour this mod writes to, so it keeps showing
@@ -1682,6 +1873,17 @@ def masher_command(args: Any) -> None:
         restore_all()
         return
 
+    if args.action == "forget":
+        # Re-judge everything at the current chance: revert, forget, sweep.
+        count = forget_all()
+        restore_all()
+        maybe_scan("forget", force=True)
+        log(
+            f"forgot {count} remembered gun(s); what you carry was judged again"
+            f" at {int(masher_chance.value)}%"
+        )
+        return
+
     # dump - everything we can see about every live weapon, with the strings
     # its object graph yielded. When identification fails this is the evidence.
     behaviours = [
@@ -1762,11 +1964,12 @@ masher_command.add_argument(
     "action",
     nargs="?",
     default="dump",
-    choices=("dump", "status", "scan", "mine", "probe", "restore"),
+    choices=("dump", "status", "scan", "mine", "probe", "restore", "forget"),
     help=(
         "dump the live weapon data, show mod status and hook activity,"
         " scan every loaded weapon now, list the guns you are carrying,"
-        " probe them in full, or undo all changes"
+        " probe them in full, undo all changes, or forget every remembered"
+        " verdict and judge your guns again at the current chance"
     ),
 )
 
