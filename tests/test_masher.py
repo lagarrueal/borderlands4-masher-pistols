@@ -1522,7 +1522,7 @@ check("scan keybind registered", len(kbs) == 1 and kbs[0].name == "Scan Weapons 
 
 cmds = env.sys.modules["mods_base"].REGISTERED["commands"]
 check("masher command registered", len(cmds) == 1 and cmds[0].cmd == "masher")
-for action in ("dump", "status", "scan", "mine", "probe", "restore", "forget", "save"):
+for action in ("dump", "status", "scan", "mine", "probe", "restore", "forget", "save", "card"):
     try:
         cmds[0](action)
         check(f"'masher {action}' runs", True)

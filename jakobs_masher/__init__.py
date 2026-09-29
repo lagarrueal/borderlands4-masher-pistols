@@ -1870,6 +1870,182 @@ def scan_keybind() -> None:
 # --------------------------------------------------------------------------- #
 
 
+
+# --------------------------------------------------------------------------- #
+# Item card research probe
+#
+# The card does not read the live fire behaviour (see CLAUDE.md). Offline data
+# narrows what it does read to a handful of structs - InventoryStatsContainer,
+# WeaponStatsContainer, InventoryItem - carried by objects nobody has looked
+# inside yet: the weapon actor itself, ground pickups, the inventory owner, and
+# the card/backpack UI collectors. `masher card` dumps all of them to a file,
+# so the next step is chosen from evidence rather than guessed.
+# --------------------------------------------------------------------------- #
+
+CARD_PROBE_FILE_NAME = "jakobs_masher_card_probe.txt"
+
+# Field names worth following one level further down.
+CARD_FIELD_RE = re.compile(
+    r"(?i)stat|item|inventor|serial|name|card|part|def|container|balance|rarity|level|title|damage|projectile"
+)
+
+# Classes to dump every field of. Each is a real class (it has a CDO); the
+# stats containers themselves are structs and can only be reached through one.
+CARD_PROBE_CLASSES = (
+    "OakUIDataCollector_ItemCard",
+    "OakUIDataCollector_Backpack",
+    "OakUIDataCollector_ItemIcon",
+    "OakInventoryOwner",
+    "InventoryPickup",
+    "InteractiveItemContainer",
+)
+
+CARD_PROBE_MAX_LINES = 6000
+CARD_PROBE_MAX_FIELDS = 300
+
+
+class _ProbeOut:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.truncated = False
+
+    def add(self, text: str) -> bool:
+        if len(self.lines) >= CARD_PROBE_MAX_LINES:
+            self.truncated = True
+            return False
+        self.lines.append(text)
+        return True
+
+
+def _probe_dump(out: _ProbeOut, obj: Any, indent: str, depth: int, seen: set[int], only_matching: bool) -> None:
+    """Every field of `obj`, following matching struct/object fields `depth` deeper."""
+    try:
+        address = obj._get_address()
+    except Exception:
+        address = None
+    if address is not None:
+        if address in seen:
+            out.add(f"{indent}(already shown)")
+            return
+        seen.add(address)
+
+    for name in _field_names(obj)[:CARD_PROBE_MAX_FIELDS]:
+        if only_matching and not CARD_FIELD_RE.search(name):
+            continue
+        try:
+            value = getattr(obj, name)
+        except Exception as exc:
+            if not out.add(f"{indent}{name}: <unreadable {type(exc).__name__}>"):
+                return
+            continue
+        if isinstance(value, BoundFunction):
+            continue
+        if not out.add(f"{indent}{name} = {_describe(value)[:200]}"):
+            return
+        if depth <= 0 or not CARD_FIELD_RE.search(name):
+            continue
+        if isinstance(value, (str, bytes, bool, int, float)) or value is None:
+            continue
+        children = _elements(value)
+        is_array = not (len(children) == 1 and children[0] is value)
+        if is_array:
+            out.add(f"{indent}  [{len(children)} element(s) shown]")
+        for index, child in enumerate(children[:3]):
+            if _as_object(child) is None:
+                continue
+            if is_array:
+                out.add(f"{indent}  [{index}]")
+            _probe_dump(out, child, indent + "    ", depth - 1, seen, only_matching=False)
+
+
+def _outer_chain(obj: Any) -> str:
+    parts = []
+    node = obj
+    for _ in range(8):
+        try:
+            node = node.Outer
+        except Exception:
+            break
+        if node is None:
+            break
+        try:
+            parts.append(node.Class.Name)
+        except Exception:
+            parts.append("?")
+    return " < ".join(parts) or "(no outer)"
+
+
+def probe_card() -> Path:
+    out = _ProbeOut()
+    out.add(f"Jakobs Masher card probe, {datetime.datetime.now().isoformat(timespec='seconds')}")
+    out.add(f"save: {current_save_id()}")
+
+    # 1. Every fire behaviour, grouped by what it lives under. Behaviours that
+    # do not sit under a weapon actor are the card's candidates.
+    out.add("")
+    out.add("== 1. fire behaviours, by outer chain ==")
+    groups: dict[str, list[UObject]] = {}
+    for behaviour in unrealsdk.find_all(FIRE_BEHAVIOUR_CLASS, False):
+        try:
+            if behaviour == behaviour.Class.ClassDefaultObject:
+                continue
+        except Exception:
+            continue
+        groups.setdefault(_outer_chain(behaviour), []).append(behaviour)
+    for chain, members in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        out.add(f"{len(members):4d} x  {chain}")
+        for behaviour in members[:3]:
+            numbers = []
+            for field in ("ProjectilesPerShot", "Damage", "Spread"):
+                subfields = _probe_property(behaviour, field)
+                value = None if subfields is None else _read_effective(behaviour, field, subfields)
+                numbers.append(f"{field}={value}")
+            out.add(f"        {behaviour._path_name()}  {'  '.join(numbers)}")
+
+    # 2. The Jakobs pistols you carry: the whole actor, one level into anything
+    # that looks like stats, item data, parts or a name.
+    out.add("")
+    out.add("== 2. your Jakobs pistols (weapon actors) ==")
+    seen: set[int] = set()
+    for weapon, behaviours in live_weapons().values():
+        if is_player_weapon(weapon) is False or not is_jakobs_pistol(weapon):
+            continue
+        out.add(f"--- {weapon.Class.Name} {weapon._path_name()}  masher={cached_masher(weapon)}")
+        _probe_dump(out, weapon, "    ", 2, seen, only_matching=False)
+
+    # 3. The player: inventory, items, containers.
+    out.add("")
+    out.add("== 3. player controller and pawn (inventory-like fields) ==")
+    pc = get_pc()
+    for label, obj in (("controller", pc), ("pawn", getattr(pc, "Pawn", None) if pc else None)):
+        if obj is None:
+            out.add(f"--- {label}: none")
+            continue
+        out.add(f"--- {label}: {obj.Class.Name} {obj._path_name()}")
+        _probe_dump(out, obj, "    ", 2, seen, only_matching=True)
+
+    # 4. Everything that might build or hold a card.
+    out.add("")
+    out.add("== 4. card / backpack / pickup / inventory classes ==")
+    for class_name in CARD_PROBE_CLASSES:
+        try:
+            instances = [o for o in unrealsdk.find_all(class_name, False) if o != o.Class.ClassDefaultObject]
+        except Exception as exc:
+            out.add(f"--- {class_name}: cannot enumerate ({exc})")
+            continue
+        out.add(f"--- {class_name}: {len(instances)} instance(s)")
+        for obj in instances[:3]:
+            out.add(f"  * {obj._path_name()}")
+            _probe_dump(out, obj, "      ", 2, seen, only_matching=False)
+
+    if out.truncated:
+        out.lines.append(f"... truncated at {CARD_PROBE_MAX_LINES} lines")
+    path = Path(_SETTINGS_DIR) / CARD_PROBE_FILE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out.lines), encoding="utf-8")
+    return path
+
+
 @command("masher", description="Inspect what Jakobs Masher is doing.")
 def masher_command(args: Any) -> None:
     if args.action == "status":
@@ -2064,6 +2240,11 @@ def masher_command(args: Any) -> None:
         restore_all()
         return
 
+    if args.action == "card":
+        path = probe_card()
+        log(f"card probe written to {path}")
+        return
+
     if args.action == "save":
         # Which save is loaded, and every candidate that was asked. When the
         # saves cannot be told apart, this is the output to report.
@@ -2182,12 +2363,13 @@ masher_command.add_argument(
     "action",
     nargs="?",
     default="dump",
-    choices=("dump", "status", "scan", "mine", "probe", "restore", "forget", "save"),
+    choices=("dump", "status", "scan", "mine", "probe", "restore", "forget", "save", "card"),
     help=(
         "dump the live weapon data, show mod status and hook activity,"
         " scan every loaded weapon now, list the guns you are carrying,"
         " probe them in full, undo all changes, forget this save's remembered"
-        " verdicts and judge your guns again, or show which save is loaded"
+        " verdicts and judge your guns again, show which save is loaded, or"
+        " dump what the item card might read to a file"
     ),
 )
 
