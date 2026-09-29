@@ -19,6 +19,7 @@ Usage:
     python pak/build_masher_pak.py              # build into build/
     python pak/build_masher_pak.py --install    # build and copy into Paks/
     python pak/build_masher_pak.py --uninstall  # remove it from Paks/
+    python pak/build_masher_pak.py --null       # control: repack inv4 unchanged
 """
 
 from __future__ import annotations
@@ -268,6 +269,12 @@ def build() -> None:
     print("Building the Jakobs Masher pak against the installed game\n")
 
     payload = extract_payload(INV_FILE, "inv4")
+    if NULL_BUILD:
+        # Control build: the game's own payload, repacked unchanged. If this
+        # alone makes the game drop items, replacing inv4 is unsafe as such.
+        print("  NULL BUILD: packing the unmodified payload as a control")
+        package(payload)
+        return
     cells = find_masher_cells(payload.read_bytes(), trace(payload, "inv4"))
     print(f"  {RENAMED_KEY} key at bit {cells['key_pos']} (gap {cells['gap']}), value at bit {cells['value_pos']}")
 
@@ -293,7 +300,10 @@ def build() -> None:
 
     # 3. Decode both and require the change to be exactly the one intended.
     verify(decode_json(payload), decode_json(patched))
+    package(patched)
 
+
+def package(patched: Path) -> None:
     root = BUILD / "_modroot"
     shutil.rmtree(root, ignore_errors=True)
     store(patched, root / "Engine" / "Content" / "_NCS" / INV_FILE)
@@ -325,6 +335,8 @@ def uninstall() -> None:
             removed += 1
     print(f"removed {removed} file(s) from {PAKS}")
 
+
+NULL_BUILD = "--null" in sys.argv
 
 if __name__ == "__main__":
     if "--uninstall" in sys.argv:
