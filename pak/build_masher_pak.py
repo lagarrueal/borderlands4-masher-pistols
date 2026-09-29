@@ -70,6 +70,19 @@ PROJECTILES = "6.000000"                  # BL3's Masher barrel fired 6
 # The barrel's damage attribute, which the trace uses to find the barrel.
 BARREL_DAMAGE_VALUE = "jak_ps_barrel_02_damage"
 
+# EXPERIMENTAL level gate: no Masher barrel below this game stage. Parts are
+# gated by a top-level `mingamestage` field (licensed accessories use it), but
+# part_barrel_02 has none and fields cannot be added. Its only plain-text
+# top-level field is its own name, `barrel: part_barrel_02` - which every part
+# in the file carries - so that field is renamed to `mingamestage` and given
+# the level. Unknown whether the game needs the name field; test before use.
+# `--no-gate` builds without it.
+GATE_ENABLED = "--no-gate" not in sys.argv
+GATE_LEVEL = "15.000000"
+GATE_RENAMED_KEY = "barrel"          # the part's own-name field
+GATE_RENAMED_VALUE = MASHER_BARREL   # "part_barrel_02"
+GATE_KEY = "mingamestage"
+
 # Per-projectile damage and spread, from the barrel's data-table row. Only
 # jak_ps part_barrel_02 reads Weapon_PS_Barrel_Init / JAK_Barrel_02 (rows of
 # the same name in the AR/SG/SR tables belong to other tables), so scaling
@@ -269,6 +282,62 @@ def find_masher_cells(payload: bytes, lines: list[str]) -> dict:
     }
 
 
+def find_gate_cell(payload: bytes, lines: list[str]) -> dict:
+    """The `barrel: part_barrel_02` own-name cell of the Masher barrel.
+
+    `jak_ps` appears as an entry in several records, and "part_barrel_02" as a
+    value in more than one place (part lists name it too, under the key
+    `part`). Only the part's own-name field has the key `barrel` in its gap;
+    exactly one such cell must exist across all the jak_ps entries.
+    """
+    blocks, data_start = string_blocks(payload)
+    keys = blocks["key_strings"]
+    key_bits = keys["bits"]
+    renamed_index = keys["strings"].index(GATE_RENAMED_KEY)
+    gate_index = keys["strings"].index(GATE_KEY)
+    data_bit = data_start * 8
+    hits = []
+    region: list = []
+    inside = False
+    for line in lines + ['ENTRY key="__end__"']:
+        if line.startswith("ENTRY "):
+            if inside:
+                for k in range(1, len(region)):
+                    m = region[k]
+                    if m.group(5) != GATE_RENAMED_VALUE:
+                        continue
+                    value_pos = int(m.group(1))
+                    gap_start = int(region[k - 1].group(1)) + int(region[k - 1].group(2))
+                    in_gap = [
+                        b for b in range(gap_start, value_pos - key_bits + 1)
+                        if read_bits(payload, data_bit + b, key_bits) == renamed_index
+                    ]
+                    if len(in_gap) == 1:
+                        hits.append({"key_pos": in_gap[0], "value_pos": value_pos})
+            inside = line.startswith(f'ENTRY key="{WEAPON}"')
+            region = []
+            continue
+        if inside:
+            m = VALUE_RE.match(line)
+            if m:
+                region.append(m)
+    if len(hits) != 1:
+        raise SystemExit(f"expected 1 '{GATE_RENAMED_KEY}: {GATE_RENAMED_VALUE}' cell, found {hits}")
+    return {**hits[0], "key_bits": key_bits, "gate_key_index": gate_index}
+
+
+def barrel_part(doc: dict) -> dict:
+    """The masher barrel's part definition, inside a decoded inv4 document."""
+    for record in doc["tables"]["inv"]["records"]:
+        for entry in record["entries"]:
+            if entry["key"] != WEAPON:
+                continue
+            for dep in entry.get("dep_entries") or []:
+                if dep.get("dep_table_name") == "barrel" and dep.get("key") == MASHER_BARREL:
+                    return dep["value"]
+    raise SystemExit(f"{MASHER_BARREL} not found")
+
+
 # --- verification ------------------------------------------------------------
 
 
@@ -290,14 +359,23 @@ def verify(original: dict, patched: dict) -> None:
     behaviour = barrel_behaviour(patched)
     if behaviour.get(MASHER_KEY) != PROJECTILES or RENAMED_KEY in behaviour:
         raise SystemExit(f"patched barrel is wrong: {json.dumps(behaviour)[:300]}")
-    # Undo the intended change on a copy; everything else must be identical.
+    if GATE_ENABLED:
+        part = barrel_part(patched)
+        if part.get(GATE_KEY) != GATE_LEVEL or GATE_RENAMED_KEY in part:
+            raise SystemExit(f"patched barrel part is wrong: {sorted(part)}")
+    # Undo the intended changes on a copy; everything else must be identical.
     undone = copy.deepcopy(patched)
     b = barrel_behaviour(undone)
     b.pop(MASHER_KEY)
     b[RENAMED_KEY] = RENAMED_VALUE
+    if GATE_ENABLED:
+        part = barrel_part(undone)
+        part.pop(GATE_KEY)
+        part[GATE_RENAMED_KEY] = GATE_RENAMED_VALUE
     if undone != original:
         raise SystemExit("the patch changed something besides the masher barrel")
-    print(f"  verified: {MASHER_BARREL} now has {MASHER_KEY}={PROJECTILES}; nothing else in the file changed")
+    gate = f", {GATE_KEY}={GATE_LEVEL}" if GATE_ENABLED else ""
+    print(f"  verified: {MASHER_BARREL} now has {MASHER_KEY}={PROJECTILES}{gate}; nothing else in the file changed")
 
 
 # --- the data table and the name part --------------------------------------
@@ -464,8 +542,14 @@ def build() -> None:
 
     # 1. Repoint the value with the shared tool (it handles pool appends and
     #    verifies its own write).
+    value_edits = [{"bitpos": cells["value_pos"], "target": PROJECTILES}]
+    gate = None
+    if GATE_ENABLED:
+        gate = find_gate_cell(payload.read_bytes(), trace(payload, "inv4"))
+        print(f"  {GATE_RENAMED_KEY} key at bit {gate['key_pos']}, value at bit {gate['value_pos']}")
+        value_edits.append({"bitpos": gate["value_pos"], "target": GATE_LEVEL})
     edits = BUILD / "_edits_inv4.json"
-    edits.write_text(json.dumps([{"bitpos": cells["value_pos"], "target": PROJECTILES}]), encoding="utf-8")
+    edits.write_text(json.dumps(value_edits), encoding="utf-8")
     stage = BUILD / "_inv4_value.bin"
     out = run([sys.executable, SCRIPTS / "ncs_multipatch.py", payload, stage, edits])
     print("  " + out.stdout.strip().replace("\n", "\n  "))
@@ -478,6 +562,11 @@ def build() -> None:
     bit = data_start * 8 + cells["key_pos"]
     before = read_bits(buf, bit, cells["key_bits"])
     write_bits(buf, bit, cells["masher_key_index"], cells["key_bits"])
+    if gate is not None:
+        gbit = data_start * 8 + gate["key_pos"]
+        gbefore = read_bits(buf, gbit, gate["key_bits"])
+        write_bits(buf, gbit, gate["gate_key_index"], gate["key_bits"])
+        print(f"  key index {gbefore} -> {gate['gate_key_index']} ({GATE_RENAMED_KEY} -> {GATE_KEY})")
     patched = BUILD / "_inv4_patched.bin"
     patched.write_bytes(bytes(buf))
     print(f"  key index {before} -> {cells['masher_key_index']} ({RENAMED_KEY} -> {MASHER_KEY})")
