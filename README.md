@@ -90,23 +90,29 @@ part would be. Changing **Masher Frequency** reshuffles which guns qualify.
 
 ## How it applies itself
 
-Equipping a weapon or interacting with the world scans immediately; a
-throttled heartbeat catches anything else. You should not need to press
-anything.
+Picking a gun up, interacting, or swapping weapons scans immediately. Any
+key press also drives a throttled sweep, and for a few seconds after a pickup
+it sweeps every half-second — the game hands a picked-up weapon over a moment
+*after* the pickup event, and this is what catches it. You should not need to
+press anything.
+
+A gun in your **backpack** has no weapon actor, so there is nothing to convert
+until it is equipped; it converts the moment you equip it.
 
 This is deliberately not built on the weapon's own events. Measured in game,
 **none** of `ServerStartUsing`, `ServerEquipInterruptible`,
 `ServerStartReloading`, `PlayEffects` or `ClientSetActiveWeaponEquipSlot` ever
-fire in solo play — BL4 resolves those natively, where the SDK cannot see them.
-They are still registered, and `masher status` shows the tally, but nothing
-depends on them:
+fire in solo play, and neither do the audio library or
+`OnEquipSlotsReadyForInventory` — BL4 resolves those natively, where the SDK
+cannot see them. They stay registered, and `masher status` shows the tally:
 
 ```
 hook activity:
   ServerStartUsing                   bound=True  fired=0
-  OnWeaponEquipped                   bound=True  fired=4
-  PostEventInWorld                   bound=True  fired=2130
-  ...
+  OnWeaponEquipped                   bound=True  fired=1
+  ServerUseObject                    bound=True  fired=...
+  PostEventInWorld                   bound=True  fired=0
+  any key press                      bound=True  fired=...
 ```
 
 If something is ever missed, the **Scan Weapons Now** keybind and `masher scan`
@@ -156,7 +162,7 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-115 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+139 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.
@@ -183,8 +189,9 @@ These cover the mod's logic. They cannot cover the live object graph — see
   `Damage` and `Spread` read back as structs carrying both a `Value` (what the
   game uses) and a `BaseValue`, and they are not all the same type —
   `ProjectilesPerShot` is an integer attribute while `Damage` and `Spread` are
-  floats. The mod writes both members, matching each one's type, and scales
-  from a fixed anchor so repeated passes cannot drift. `masher probe` dumps
+  floats. The mod owns `BaseValue`, kicks `Value` into place when
+  it first applies, and then leaves `Value` to the engine so buffs and debuffs
+  still stack on top. `masher probe` dumps
   them in full.
 - Disabling the mod restores every gun it touched.
 

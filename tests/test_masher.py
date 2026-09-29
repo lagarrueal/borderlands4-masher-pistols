@@ -80,6 +80,7 @@ def reset_mod() -> None:
     jm._missing_reported.clear()
     jm._shape_reported.clear()
     jm._drift_reported.clear()
+    jm._not_ours_reported.clear()
     env.reset_world()
 
 
@@ -430,9 +431,9 @@ sw, sb = make_struct_weapon()
 
 applied = jm.make_masher(sb)
 check(
-    "struct-valued knobs resolve to their effective member first",
+    "struct-valued knobs report the member the mod owns",
     applied
-    == ["ProjectilesPerShot.Value", "Damage.Value", "Spread.Value"],
+    == ["ProjectilesPerShot.BaseValue", "Damage.BaseValue", "Spread.BaseValue"],
     str(applied),
 )
 check(
@@ -536,11 +537,12 @@ dw, db = make_struct_weapon()
 jm.make_masher(db)
 check("no drift right after writing", jm.check_drift(db) == [], str(jm.check_drift(db)))
 
-# Simulate the engine re-resolving the value from its data-table source.
+# Simulate the engine re-initialising the weapon: the owned member resets.
+db.ProjectilesPerShot.BaseValue = 1
 db.ProjectilesPerShot.Value = 1
 drift = jm.check_drift(db)
 check(
-    "a reverted value is detected",
+    "a reset base value is detected",
     any("projectiles" in d for d in drift),
     str(drift),
 )
@@ -642,6 +644,189 @@ check(
     "scaling an int member rounds to an int",
     round_b.Spread.Value == 9 and isinstance(round_b.Spread.Value, int),
     f"{round_b.Spread.Value!r}",
+)
+
+# --------------------------------------------------------------------------- #
+# In game, picking a gun up fires the use event BEFORE the game hands the weapon
+# over. The scan it triggered saw a Jakobs revolver owned by nobody, and the old
+# code cached "not ours" permanently - so picked-up guns only converted after a
+# swap respawned them as new actors.
+print("\n== ownership is re-checked, never cached as a no ==")
+reset_mod()
+jm.masher_frequency.value = 4
+pc, pawn = make_player()
+
+ground_w, ground_b = make_struct_weapon()
+nobody = env.FakeObject("OakCharacter", path="World.Nobody")
+ground_w._props["WeaponUser"] = nobody  # mid-pickup: not handed over yet
+
+jm.maybe_scan("used an object", force=True)
+check("mid-pickup the gun is not converted", ground_b.ProjectilesPerShot.Value == 1)
+check(
+    "and the 'not ours' verdict is not cached",
+    ground_w._get_address() not in jm._weapon_cache,
+    str(jm._weapon_cache.get(ground_w._get_address())),
+)
+
+ground_w._props["WeaponUser"] = pawn  # the game finishes the handover
+jm.maybe_scan("next pass", force=True)
+check("once it is ours, the next pass converts it", ground_b.ProjectilesPerShot.Value == 6)
+
+# Re-checking every pass must not mean logging every pass.
+reset_mod()
+jm.masher_frequency.value = 4
+pc, pawn = make_player()
+enemy_w, enemy_b = make_struct_weapon()
+enemy_w._props["WeaponUser"] = env.FakeObject("OakCharacter", path="World.Enemy")
+jm.verbose_logging.value = True
+import io as _io
+import contextlib as _contextlib
+
+_buf = _io.StringIO()
+with _contextlib.redirect_stdout(_buf):
+    for _ in range(5):
+        jm.maybe_scan("pass", force=True)
+jm.verbose_logging.value = False
+check(
+    "an enemy's revolver is reported once, not every pass",
+    _buf.getvalue().count("not ours") == 1,
+    f"{_buf.getvalue().count('not ours')} reports",
+)
+check("and never converted", enemy_b.ProjectilesPerShot.Value == 1)
+env.set_player(None)
+
+# --------------------------------------------------------------------------- #
+# The audio heartbeat never fired. Input does: the keybinds module accepts None
+# as "any key", riding the InputKey detour keybinds already depend on.
+print("\n== the input heartbeat ==")
+reset_mod()
+env.RAW_KEYBINDS.clear()
+jm.stop_input_heartbeat()
+
+check("heartbeat starts on enable", jm.start_input_heartbeat() is True)
+registered = list(env.RAW_KEYBINDS.values())
+check(
+    "registered for any key, on press",
+    len(registered) == 1
+    and registered[0][0] is None
+    and registered[0][1].name == "IE_Pressed",
+    str([(k, e.name) for k, e, _ in registered]),
+)
+check("starting twice does not register twice", jm.start_input_heartbeat() and len(env.RAW_KEYBINDS) == 1)
+
+class _HeartbeatClock:
+    def __init__(self):
+        self.now = 5000.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+clock2 = _HeartbeatClock()
+real_time2 = jm.time
+jm.time = clock2
+jm._last_scan = 0.0
+jm._fast_until = 0.0
+jm.auto_scan.value = True
+jm.scan_interval.value = 3
+
+sweeps = {"n": 0}
+real_scan_all2 = jm.scan_all
+
+
+def counting_scan2():
+    sweeps["n"] += 1
+    return 0
+
+
+jm.scan_all = counting_scan2
+
+results = env.press_any_key()
+check("a key press sweeps", sweeps["n"] == 1, str(sweeps["n"]))
+check("and never blocks the key", results == [None], str(results))
+
+for _ in range(20):
+    env.press_any_key()
+check("held-down typing is throttled", sweeps["n"] == 1, str(sweeps["n"]))
+clock2.advance(3.5)
+env.press_any_key()
+check("the next press after the interval sweeps", sweeps["n"] == 2, str(sweeps["n"]))
+
+# After a pickup the heartbeat briefly runs fast, so the late-arriving weapon
+# converts within a keypress or two rather than waiting out the interval.
+jm._scan_and_follow_up("used an object")
+after_pickup = sweeps["n"]
+clock2.advance(0.6)
+env.press_any_key()
+check("inside the fast window a press sweeps sooner", sweeps["n"] == after_pickup + 1, str(sweeps["n"]))
+clock2.advance(jm.FAST_WINDOW_SECONDS + 1)
+env.press_any_key()
+before = sweeps["n"]
+clock2.advance(0.6)
+env.press_any_key()
+check("after the window it slows back down", sweeps["n"] == before, str(sweeps["n"]))
+
+jm.scan_all = real_scan_all2
+jm.time = real_time2
+jm._last_scan = 0.0
+jm._fast_until = 0.0
+
+jm.stop_input_heartbeat()
+check("heartbeat stops on disable", len(env.RAW_KEYBINDS) == 0, str(len(env.RAW_KEYBINDS)))
+
+jm.on_mod_enabled()
+check("enabling the mod starts it", len(env.RAW_KEYBINDS) == 1)
+jm.on_mod_disabled()
+check("disabling the mod stops it", len(env.RAW_KEYBINDS) == 0)
+
+# --------------------------------------------------------------------------- #
+# The engine derives Value from BaseValue x modifiers (measured 1.300x exactly).
+# With a heartbeat that actually runs, re-writing Value every pass would strip
+# every buff every few seconds. The mod owns BaseValue; Value is only kicked.
+print("\n== BaseValue is owned, Value is left to the engine ==")
+reset_mod()
+jm.masher_frequency.value = 4
+bw, bb = make_struct_weapon(damage=100.0)
+jm.make_masher(bb)
+check(
+    "first touch sets both members",
+    abs(bb.Damage.BaseValue - 40.0) < 1e-6 and abs(bb.Damage.Value - 40.0) < 1e-6,
+    f"Base={bb.Damage.BaseValue} Value={bb.Damage.Value}",
+)
+
+bb.Damage.Value = 52.0  # a +30% damage buff, applied by the engine
+for _ in range(5):
+    jm.make_masher(bb)
+check("a buff on Value survives repeated passes", abs(bb.Damage.Value - 52.0) < 1e-6, str(bb.Damage.Value))
+check("and is not reported as drift", jm.check_drift(bb) == [], str(jm.check_drift(bb)))
+
+bb.Damage.BaseValue = 100.0  # the engine re-initialised the weapon
+bb.Damage.Value = 100.0
+check("a reset base IS drift", any("damage" in d for d in jm.check_drift(bb)))
+jm.make_masher(bb)
+check(
+    "and is re-applied from the anchor",
+    abs(bb.Damage.BaseValue - 40.0) < 1e-6 and abs(bb.Damage.Value - 40.0) < 1e-6,
+    f"Base={bb.Damage.BaseValue} Value={bb.Damage.Value}",
+)
+
+jm.damage_scale.value = 0.5
+jm.make_masher(bb)
+check(
+    "changing the option re-applies both members",
+    abs(bb.Damage.BaseValue - 50.0) < 1e-6 and abs(bb.Damage.Value - 50.0) < 1e-6,
+    f"Base={bb.Damage.BaseValue} Value={bb.Damage.Value}",
+)
+jm.damage_scale.value = 0.40
+
+jm.restore_all()
+check(
+    "restore puts both anchors back",
+    abs(bb.Damage.BaseValue - 100.0) < 1e-6 and abs(bb.Damage.Value - 100.0) < 1e-6,
+    f"Base={bb.Damage.BaseValue} Value={bb.Damage.Value}",
 )
 
 # End to end through the sweep, with the realistic shape.
@@ -985,7 +1170,7 @@ env.set_player(None)
 
 # --------------------------------------------------------------------------- #
 mod_kwargs = env.sys.modules["mods_base"].REGISTERED["mod"]
-check("restore wired to disable", mod_kwargs.get("on_disable") is jm.restore_all)
+check("disable stops the heartbeat and restores", mod_kwargs.get("on_disable") is jm.on_mod_disabled)
 check("report wired to enable", mod_kwargs.get("on_enable") is jm.on_mod_enabled)
 
 try:

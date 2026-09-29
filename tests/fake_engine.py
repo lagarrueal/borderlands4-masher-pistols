@@ -15,6 +15,19 @@ from typing import Any
 
 _NEXT_ADDR = [0x1000]
 
+# Raw keybinds registered through keybinds.keybinds, handle -> (key, event, cb).
+RAW_KEYBINDS: dict[object, tuple] = {}
+
+
+def press_any_key() -> list:
+    """Deliver one key press to every any-key raw keybind."""
+    results = []
+    for key, event, callback in list(RAW_KEYBINDS.values()):
+        if key is None and event.name == "IE_Pressed":
+            results.append(callback())
+    return results
+
+
 # The local player controller, as mods_base.get_pc() would return it.
 PLAYER: dict[str, object] = {"pc": None}
 
@@ -324,9 +337,35 @@ def install() -> None:
     mods_base.SliderOption = SliderOption
     mods_base.CoopSupport = CoopSupport
     mods_base.build_mod = build_mod
+    class EInputEvent(Enum):
+        IE_Pressed = auto()
+        IE_Released = auto()
+        IE_Repeat = auto()
+        IE_DoubleClick = auto()
+        IE_Axis = auto()
+
     mods_base.command = command
     mods_base.hook = hook
     mods_base.keybind = keybind
     mods_base.get_pc = get_pc
+    mods_base.EInputEvent = EInputEvent
     mods_base.REGISTERED = REGISTERED
     sys.modules["mods_base"] = mods_base
+
+    # The native keybinds module: register_keybind(None, ...) means any key.
+    keybinds_pkg = types.ModuleType("keybinds")
+    keybinds_mod = types.ModuleType("keybinds.keybinds")
+
+    def register_keybind(key, event, callback):
+        handle = object()
+        RAW_KEYBINDS[handle] = (key, event, callback)
+        return handle
+
+    def deregister_keybind(handle):
+        RAW_KEYBINDS.pop(handle, None)
+
+    keybinds_mod.register_keybind = register_keybind
+    keybinds_mod.deregister_keybind = deregister_keybind
+    keybinds_pkg.keybinds = keybinds_mod
+    sys.modules["keybinds"] = keybinds_pkg
+    sys.modules["keybinds.keybinds"] = keybinds_mod

@@ -28,6 +28,7 @@ import unrealsdk
 from mods_base import (
     BoolOption,
     CoopSupport,
+    EInputEvent,
     SliderOption,
     build_mod,
     command,
@@ -389,6 +390,10 @@ OWNER_FIELDS = ("WeaponUser", "Owner", "Instigator", "BodyOwner")
 
 _ownership_field: str | None = None
 _ownership_warned = False
+
+# Weapons already logged as "not ours", so re-checking every pass - which is
+# now the point - does not also mean logging every pass.
+_not_ours_reported: set[int] = set()
 
 
 def _player_objects() -> set[int]:
@@ -755,89 +760,101 @@ def _members(subfields):
     return subfields if subfields else (None,)
 
 
-def _scale_field(behaviour, knob, scale):
-    """Multiply every numeric member, re-basing if the game moved it."""
+# Which member of an attribute struct this mod owns.
+#
+# The engine derives `Value` from `BaseValue` times whatever modifiers are
+# active - measured: a Masher's damage re-read as 69.1113 against our 53.1625,
+# exactly 1.300x. So the mod owns `BaseValue` and leaves `Value` to the engine,
+# writing `Value` only when (re)applying, to kick it into place straight away
+# (the engine does not recompute it just because `BaseValue` changed). Writing
+# `Value` on every pass instead would strip every buff and debuff each time the
+# heartbeat ran.
+OWNED_MEMBER = "BaseValue"
+
+
+def _owned(subfields):
+    """The member to enforce: BaseValue if present, else the only one there."""
+    if not subfields:
+        return None
+    return OWNED_MEMBER if OWNED_MEMBER in subfields else subfields[0]
+
+
+def _write_knob(behaviour, knob, want):
+    """Apply a knob, where `want(member, anchor)` gives each member's target.
+
+    Anchors are the values first seen, per member. Every member is written on
+    first touch and whenever the owned member has left our value - an engine
+    re-init, or the option being changed. Otherwise nothing is written, so the
+    engine keeps layering modifiers onto the base we set.
+    """
     resolved = _resolve_field(behaviour, knob)
     if resolved is None:
         return None
     field, subfields = resolved
+    owned = _owned(subfields)
 
     state = _touched.setdefault(behaviour._get_address(), {})
-    targets = {}
-    bases = {}
-
+    anchors = {}
     for name in _members(subfields):
+        record = state.get(_state_key(field, name))
+        if record is not None:
+            anchors[name] = record["original"]
+            continue
         current = _read_member(behaviour, field, name)
         if current is None:
             return None
-        previous = state.get(_state_key(field, name))
-        # Anchor to the value seen the very first time, and always write
-        # anchor * scale. Re-basing on whatever is there now looks like it
-        # respects buffs, but the engine recomputes Damage from BaseValue, so
-        # each pass would scale its own output and the number would shrink
-        # every scan. Buffs still apply - the engine layers them on top of the
-        # base we set.
-        base = previous["original"] if previous is not None else current
-        bases[name] = base
-        targets[name] = base * scale
+        anchors[name] = current
+
+    targets = {name: want(name, anchors[name]) for name in _members(subfields)}
+
+    current_owned = _read_member(behaviour, field, owned)
+    first_touch = _state_key(field, owned) not in state
+    if (
+        not first_touch
+        and current_owned is not None
+        and abs(current_owned - targets[owned]) < 1e-3
+    ):
+        # Still ours. Leave Value to the engine.
+        return _state_key(field, owned)
 
     if not _apply_numbers(behaviour, field, subfields, targets):
         return None
 
     for name in _members(subfields):
         state[_state_key(field, name)] = {
-            "original": bases[name],
+            "original": anchors[name],
             "applied": targets[name],
             "field": field,
             "subfield": name,
         }
-    return _state_key(field, subfields[0] if subfields else None)
+    return _state_key(field, owned)
+
+
+def _scale_field(behaviour, knob, scale):
+    """Scale every member from its anchor. See _write_knob."""
+    return _write_knob(behaviour, knob, lambda _name, anchor: anchor * scale)
 
 
 def _set_field(behaviour, knob, value):
-    """Set every numeric member outright."""
-    resolved = _resolve_field(behaviour, knob)
-    if resolved is None:
-        return None
-    field, subfields = resolved
-
-    state = _touched.setdefault(behaviour._get_address(), {})
-    originals = {}
-    for name in _members(subfields):
-        current = _read_member(behaviour, field, name)
-        if current is None:
-            return None
-        originals[name] = current
-
-    targets = {name: float(value) for name in _members(subfields)}
-    if not _apply_numbers(behaviour, field, subfields, targets):
-        return None
-
-    for name in _members(subfields):
-        key = _state_key(field, name)
-        if key not in state:
-            state[key] = {
-                "original": originals[name],
-                "applied": float(value),
-                "field": field,
-                "subfield": name,
-            }
-        else:
-            state[key]["applied"] = float(value)
-    return _state_key(field, subfields[0] if subfields else None)
+    """Set every member to a fixed value. See _write_knob."""
+    return _write_knob(behaviour, knob, lambda _name, _anchor: float(value))
 
 
 def _verify(behaviour, knob):
-    """Read a knob's effective value back after writing."""
+    """Compare the owned member with what we last wrote to it.
+
+    Only the owned member counts: `Value` moving is the engine applying a buff,
+    which is supposed to happen.
+    """
     resolved = _resolved_fields.get(knob)
     if not resolved:
         return None
     field, subfields = resolved
-    key = _state_key(field, subfields[0] if subfields else None)
-    record = _touched.get(behaviour._get_address(), {}).get(key)
+    owned = _owned(subfields)
+    record = _touched.get(behaviour._get_address(), {}).get(_state_key(field, owned))
     if record is None:
         return None
-    actual = _read_effective(behaviour, field, subfields)
+    actual = _read_member(behaviour, field, owned)
     if actual is None:
         return None
     return float(record["applied"]), actual
@@ -866,8 +883,7 @@ def make_masher(behaviour: UObject) -> list[str]:
     reverted = check_drift(behaviour)
     if reverted and behaviour._get_address() not in _drift_reported:
         _drift_reported.add(behaviour._get_address())
-        log(f"value(s) did not persist since the last pass: {'; '.join(reverted)}")
-        log("  the game is re-resolving these - writing BaseValue is not enough")
+        debug(f"the engine reset a base value, re-applying: {'; '.join(reverted)}")
 
     applied: list[str] = []
     for field in (
@@ -911,6 +927,7 @@ def restore_all() -> None:
     _missing_reported.clear()
     _shape_reported.clear()
     _drift_reported.clear()
+    _not_ours_reported.clear()
     if restored:
         log(f"restored {restored} weapon(s)")
 
@@ -1038,8 +1055,15 @@ def process_weapon(weapon: UObject, known: list[UObject] | None = None) -> None:
         global _ownership_warned
         owned = is_player_weapon(weapon)
         if owned is False:
-            debug(f"{path} is a Jakobs revolver, but not ours")
-            _weapon_cache[address] = (path, [], False)
+            # Deliberately NOT cached. Picking a gun up fires the use event
+            # before the game hands the weapon over, so this runs while the
+            # revolver still belongs to nobody. Caching that verdict made
+            # every picked-up gun permanently ineligible until a swap
+            # respawned it as a new actor. Ownership is cheap to re-check;
+            # identity and the roll are what get cached.
+            if address not in _not_ours_reported:
+                _not_ours_reported.add(address)
+                debug(f"{path} is a Jakobs revolver, but not ours (yet) - will re-check")
             return
         if owned is None and not _ownership_warned:
             _ownership_warned = True
@@ -1101,6 +1125,20 @@ _last_scan = 0.0
 IMMEDIATE_FLOOR_SECONDS = 0.25
 
 
+# After a pickup or equip, the weapon actor and its ownership arrive a moment
+# after the event that announced them. For this long afterwards the heartbeat
+# may sweep much more often, so the conversion lands within a keypress or two.
+FAST_WINDOW_SECONDS = 6.0
+FAST_INTERVAL_SECONDS = 0.5
+_fast_until = 0.0
+
+
+def request_follow_up() -> None:
+    """Open the fast window: something is about to arrive."""
+    global _fast_until
+    _fast_until = time.monotonic() + FAST_WINDOW_SECONDS
+
+
 def maybe_scan(reason: str, immediate: bool = False, force: bool = False) -> int:
     """Sweep, unless one ran too recently. Returns weapons processed."""
     global _last_scan
@@ -1110,7 +1148,12 @@ def maybe_scan(reason: str, immediate: bool = False, force: bool = False) -> int
 
     now = time.monotonic()
     if not force:
-        interval = IMMEDIATE_FLOOR_SECONDS if immediate else float(scan_interval.value)
+        if immediate:
+            interval = IMMEDIATE_FLOOR_SECONDS
+        elif now < _fast_until:
+            interval = FAST_INTERVAL_SECONDS
+        else:
+            interval = float(scan_interval.value)
         if now - _last_scan < interval:
             return 0
     _last_scan = now
@@ -1185,7 +1228,7 @@ def on_weapon_swap(
     ret: Any,
     func: BoundFunction,
 ) -> None:
-    _guard("ClientSetActiveWeaponEquipSlot", lambda: maybe_scan("weapon swap", True))
+    _guard("ClientSetActiveWeaponEquipSlot", lambda: _scan_and_follow_up("weapon swap"))
 
 
 @hook("/Script/OakGame.OakUIDataCollector_Weapon:OnWeaponEquipped", Type.POST)
@@ -1195,7 +1238,7 @@ def on_ui_weapon_equipped(
     ret: Any,
     func: BoundFunction,
 ) -> None:
-    _guard("OnWeaponEquipped", lambda: maybe_scan("weapon equipped", True))
+    _guard("OnWeaponEquipped", lambda: _scan_and_follow_up("weapon equipped"))
 
 
 @hook("/Script/OakGame.OakPlayerController:ServerUseObject", Type.POST)
@@ -1206,7 +1249,7 @@ def on_use_object(
     func: BoundFunction,
 ) -> None:
     # Interacting with the world - which is how a dropped gun gets picked up.
-    _guard("ServerUseObject", lambda: maybe_scan("used an object", True))
+    _guard("ServerUseObject", lambda: _scan_and_follow_up("used an object"))
 
 
 @hook("/Script/OakGame.OakPlayerController:ServerUseJunkObject", Type.POST)
@@ -1217,7 +1260,7 @@ def on_use_junk(
     func: BoundFunction,
 ) -> None:
     # Proven reachable: trashSeller hooks exactly this.
-    _guard("ServerUseJunkObject", lambda: maybe_scan("used a junk object", True))
+    _guard("ServerUseJunkObject", lambda: _scan_and_follow_up("used a junk object"))
 
 
 @hook("/Script/OakGame.OakPlayerController:OnEquipSlotsReadyForInventory", Type.POST)
@@ -1227,7 +1270,7 @@ def on_slots_ready(
     ret: Any,
     func: BoundFunction,
 ) -> None:
-    _guard("OnEquipSlotsReadyForInventory", lambda: maybe_scan("equip slots ready", True))
+    _guard("OnEquipSlotsReadyForInventory", lambda: _scan_and_follow_up("equip slots ready"))
 
 
 @hook("/Script/GbxAudio.GbxAudioBlueprintFunctionLibrary:PostEventInWorld", Type.POST)
@@ -1241,6 +1284,71 @@ def on_audio_event(
     # throttled to `Scan Interval` and does nothing most of the time. Proven
     # reachable: music_watch hooks this library.
     _guard("PostEventInWorld", lambda: maybe_scan("audio heartbeat"))
+
+
+def _scan_and_follow_up(reason: str) -> None:
+    """Sweep now, and keep sweeping briefly for whatever arrives late."""
+    maybe_scan(reason, immediate=True)
+    request_follow_up()
+
+
+# --------------------------------------------------------------------------- #
+# The real heartbeat: every key press.
+#
+# `PostEventInWorld` and `OnEquipSlotsReadyForInventory` bound and never fired,
+# so the audio "heartbeat" never beat. What demonstrably does reach Python on
+# this install is input - the SDK detours UGbxEnhancedPlayerInput::InputKey,
+# which is how keybinds work at all. The keybinds module accepts `None` as the
+# key to mean "any key", so moving, firing, swapping and pressing E to pick
+# something up all drive the sweep. It is throttled like everything else and
+# never blocks the key.
+# --------------------------------------------------------------------------- #
+
+try:
+    from keybinds.keybinds import (  # type: ignore[import-not-found]
+        deregister_keybind as _deregister_raw_key,
+        register_keybind as _register_raw_key,
+    )
+except Exception:  # pragma: no cover - depends on the SDK build
+    _register_raw_key = None
+    _deregister_raw_key = None
+
+_input_handle = None
+INPUT_HEARTBEAT = "any key press"
+
+
+def _on_any_key() -> None:
+    """Called for every key press in the game: must stay cheap, never block."""
+    _guard(INPUT_HEARTBEAT, lambda: maybe_scan("input"))
+    return None
+
+
+def start_input_heartbeat() -> bool:
+    global _input_handle
+    if _input_handle is not None:
+        return True
+    if _register_raw_key is None:
+        log("no raw keybind support in this SDK build - heartbeat unavailable")
+        return False
+    try:
+        _input_handle = _register_raw_key(None, EInputEvent.IE_Pressed, _on_any_key)
+    except Exception as exc:
+        log(f"could not start the input heartbeat: {exc}")
+        _input_handle = None
+        return False
+    return True
+
+
+def stop_input_heartbeat() -> None:
+    global _input_handle
+    if _input_handle is None or _deregister_raw_key is None:
+        _input_handle = None
+        return
+    try:
+        _deregister_raw_key(_input_handle)
+    except Exception:
+        pass
+    _input_handle = None
 
 
 HOOKS = (
@@ -1272,10 +1380,12 @@ def on_mod_enabled() -> None:
     log(f"hooks bound: {', '.join(bound) if bound else 'NONE'}")
     if unbound:
         log(f"hooks NOT bound: {', '.join(unbound)}")
+    heartbeat = start_input_heartbeat()
     if auto_scan.value:
         log(
-            f"automatic scanning on, heartbeat every {int(scan_interval.value)}s"
-            " - equipping and interacting scan immediately"
+            "automatic scanning on - equipping and interacting scan immediately,"
+            f" key presses at most every {int(scan_interval.value)}s"
+            + ("" if heartbeat else " (INPUT HEARTBEAT UNAVAILABLE)")
         )
     else:
         log("automatic scanning off - use the 'Scan Weapons Now' keybind")
@@ -1319,6 +1429,10 @@ def masher_command(args: Any) -> None:
                     f"  {short:<34} bound={bool(hook_obj.get_active_count())}"
                     f"  fired={_fires.get(short, 0)}"
                 )
+        log(
+            f"  {INPUT_HEARTBEAT:<34} bound={_input_handle is not None}"
+            f"  fired={_fires.get(INPUT_HEARTBEAT, 0)}"
+        )
         log(f"weapons seen: {len(_weapon_cache)}, behaviours modified: {len(_touched)}")
         for path, pointers, is_masher in _weapon_cache.values():
             log(f"  masher={is_masher}  behaviours={len(pointers)}  {path}")
@@ -1552,8 +1666,13 @@ masher_command.add_argument(
 
 # --------------------------------------------------------------------------- #
 
+def on_mod_disabled() -> None:
+    stop_input_heartbeat()
+    restore_all()
+
+
 build_mod(
     coop_support=CoopSupport.HostOnly,
     on_enable=on_mod_enabled,
-    on_disable=restore_all,
+    on_disable=on_mod_disabled,
 )

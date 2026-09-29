@@ -186,22 +186,56 @@ being real is necessary, not sufficient.
 This is why `scan_all()` exists: a hook-independent sweep that walks every live
 fire behaviour up to its weapon via `owning_weapon()`.
 
-**Automatic application therefore rides on events that are reachable**, picked
-by copying what working mods already hook rather than by guessing again:
+**Automatic application therefore rides on events that are reachable.** The
+first attempt picked triggers by copying what other mods hook; measured in the
+next session, two of those never fired either:
 
-| Trigger | Why it was chosen | Throttle |
+| Trigger | Measured | Role |
 |---|---|---|
-| `OakUIDataCollector_Weapon:OnWeaponEquipped` | the equip event the UI itself uses | immediate |
-| `OakPlayerController:ServerUseObject` | interacting, i.e. picking a gun up | immediate |
-| `OakPlayerController:ServerUseJunkObject` | trashSeller hooks exactly this, so it is proven reachable | immediate |
-| `OakPlayerController:OnEquipSlotsReadyForInventory` | inventory ready after a load | immediate |
-| `GbxAudio.GbxAudioBlueprintFunctionLibrary:PostEventInWorld` | music_watch hooks this library; fires constantly, so it is the heartbeat | `Scan Interval`, default 3s |
+| `OakPlayerController:ServerUseObject` | **fires** | pickup / interact — sweep now, open fast window |
+| `OakPlayerController:ServerUseJunkObject` | **fires** | same (trashSeller hooks it) |
+| `OakUIDataCollector_Weapon:OnWeaponEquipped` | **fires** | inventory swap — sweep now, open fast window |
+| `OakPlayerController:OnEquipSlotsReadyForInventory` | never fired | kept, costs nothing |
+| `GbxAudio...:PostEventInWorld` | **never fired** | the intended heartbeat; kept, costs nothing |
+| any key press (raw keybind) | fires by construction | **the real heartbeat** |
+
+"music_watch hooks this library" proved only that the hooks *bind* — its log
+says `hook OK`, which is registration, not a call. Bound is not fired.
+
+**The heartbeat is input.** The SDK detours `UGbxEnhancedPlayerInput::InputKey`
+(visible in `unrealsdk.log`), which is how keybinds work at all, and the native
+`keybinds.keybinds.register_keybind` accepts `None` as the key to mean *any*
+key. Registered on `IE_Pressed` only — axis events (mouse look) would be far too
+frequent — it fires on moving, firing, swapping, and pressing E to pick up:
+exactly while you are playing. `mods_base`'s `@keybind` cannot do this; its
+`enable_keybind` returns early when `key is None`, so the module is called
+directly and deregistered in `on_mod_disabled`. The callback returns `None`
+so the key is never blocked.
 
 `maybe_scan()` holds the throttle: `force` for the keybind and console (always
-works, even with automatic scanning off), `immediate` for equip-like events
-(floored at 0.25s so an equip burst collapses to one sweep), and the interval
-for the heartbeat. A sweep that raises is contained rather than escaping into
-the engine.
+works, even with automatic scanning off), `immediate` for pickup/equip events
+(floored at 0.25s so a burst collapses to one sweep), and the interval for the
+heartbeat. Pickup/equip events also open a **fast window** — 6s during which the
+heartbeat may sweep every 0.5s — because the weapon actor and its ownership
+arrive a moment *after* the event that announced them. A sweep that raises is
+contained rather than escaping into the engine.
+
+### Ownership must never be cached as a no
+
+Measured: picking up a Jakobs revolver logged
+
+```
+12:04:58  OakWeapon_2147406817 is a Jakobs revolver, but not ours
+12:06:38  Masher: OakWeapon_2147402983        <- only after an inventory swap
+```
+
+`ServerUseObject` fires before the game hands the weapon over, so the sweep it
+triggers sees a revolver owned by nobody. The old code cached that verdict in
+`_weapon_cache`, making the gun permanently ineligible; an inventory swap
+"fixed" it only because it respawned the weapon as a new actor at a new
+address. Ownership is now re-checked every pass. Identity (the graph walk) and
+the Masher roll are what get cached — both are fixed properties of the gun, and
+ownership is not.
 
 ### Identity is not a property — it is a graph walk
 
@@ -298,14 +332,29 @@ then `int`, then `float`, and the rewrite that added `Value` support replaced
 that with a hard `float()`. A retry loop was doing real work and its removal
 went unnoticed because the tests only ever used float members.
 
-### Scaling anchors, it does not re-base
+### Own `BaseValue`; leave `Value` to the engine
 
-The same run showed `damage expected 75.9161 but reads 91.6948` — the engine
-recomputes `Damage` from `BaseValue`. Re-basing on the current value each pass
-therefore scales the previous result, and the number shrinks on every scan.
-Scaling is now anchored to the value first seen: always `anchor * scale`. Buffs
-still work, applied by the engine on top of the base we set, rather than by us
-chasing them.
+The engine derives `Value` from `BaseValue` times whatever modifiers are active.
+Measured on a Masher: damage re-read as `69.1113` against the `53.1625` written —
+exactly **1.300×**, a buff layered on our base; another read `114.068` against
+`117.933`, 0.967×.
+
+Two wrong answers came first. Re-basing on the current value each pass scaled
+the engine's output again, so damage shrank every scan. Anchoring and
+re-writing *both* members every pass fixed the shrink but stripped every buff —
+harmless while no heartbeat fired, and a real regression the moment one did.
+
+So `_write_knob` anchors each member to the value first seen and then:
+
+- **first touch**: writes every member — `BaseValue` for real, `Value` as a kick,
+  since the engine does not recompute `Value` just because `BaseValue` changed;
+- **later passes**: writes *nothing* while `BaseValue` still holds our value, so
+  buffs and debuffs on `Value` survive;
+- **`BaseValue` moved** (engine re-init) **or the option changed**: re-applies
+  every member from the anchors.
+
+`check_drift` watches `BaseValue` only. `Value` moving is the engine doing its
+job; `BaseValue` moving is the only thing that means our change was undone.
 
 The general lesson, now paid for several times over: **a property is not a
 number, a number is not the number, and the numbers are not the same type.**
