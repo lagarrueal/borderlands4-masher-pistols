@@ -81,9 +81,16 @@ def reset_mod() -> None:
     jm._shape_reported.clear()
     jm._drift_reported.clear()
     jm._not_ours_reported.clear()
-    jm._registry = None
-    jm._registry_unreadable = False
-    jm.registry_path().unlink(missing_ok=True)
+    jm._registries.clear()
+    jm._unreadable_saves.clear()
+    jm._save_source = None
+    jm._current_save = None
+    jm._next_save_lookup = 0.0
+    jm._save_fallback_reported = False
+    import shutil as _shutil
+
+    _shutil.rmtree(jm.registry_dir(), ignore_errors=True)
+    (jm.registry_dir().parent / jm.LEGACY_REGISTRY_FILE_NAME).unlink(missing_ok=True)
     env.reset_world()
 
 
@@ -1020,7 +1027,7 @@ for chance in (0, 100, 17):
 
 # A restart: nothing in memory, the same guns come back as new actors.
 jm.restore_all()
-jm._registry = None
+jm._registries.clear()
 jm.masher_chance.value = 0
 pool = make_pool()
 check("after a restart every gun keeps its verdict", mashers_in(pool) == at_half)
@@ -1068,6 +1075,7 @@ check(
 
 # A record that cannot be read is never overwritten.
 reset_mod()
+jm.registry_dir().mkdir(parents=True, exist_ok=True)
 jm.registry_path().write_text("{not json", encoding="utf-8")
 jm.masher_chance.value = 100
 bad_w, bad_b = make_weapon("JAK_PS", (5, 5, 5, 5))
@@ -1104,6 +1112,126 @@ check(
     or not __import__("json").loads(jm.registry_path().read_text(encoding="utf-8"))["guns"],
 )
 check("it is remembered for the session", jm.cached_masher(fp_w) is True)
+
+# --------------------------------------------------------------------------- #
+# Each save gets its own record, named after the character GUID the save file
+# stores. The GUID is read from whichever live object holds it.
+print("\n== one record per save ==")
+reset_mod()
+
+
+_profile = {"obj": None}
+
+
+def load_character(guid_parts, holder_class="OakActiveProfile", field="ActiveCharGuid"):
+    """Load a character: a fresh level, and the profile's GUID updated in place.
+
+    The profile object outlives a character switch, so the mod's cached link
+    to it must pick up the new GUID rather than keep the old one.
+    """
+    env.reset_world()
+    a, b, c, d = guid_parts
+    guid = env.WrappedStruct(A=a, B=b, C=c, D=d)
+    if _profile["obj"] is None:
+        _profile["obj"] = env.FakeObject(holder_class, path=f"Transient.{holder_class}_0", **{field: guid})
+    else:
+        _profile["obj"]._props[field] = guid
+    return _profile["obj"]
+
+
+check("the save file's GUID format", jm._format_guid(env.WrappedStruct(A=0x3B671166, B=0x41774DAB, C=0x955F2AB4, D=0x1769A961)) == "3B67116641774DAB955F2AB41769A961")
+check("negative ints are read as unsigned", jm._format_guid(env.WrappedStruct(A=-1, B=0, C=0, D=1)) == "FFFFFFFF000000000000000000000001")
+check("an all-zero GUID means no character", jm._format_guid(env.WrappedStruct(A=0, B=0, C=0, D=0)) is None)
+check("a GUID string is normalised", jm._format_guid("{3b671166-4177-4dab-955f-2ab41769a961}") == "3B67116641774DAB955F2AB41769A961")
+
+LOVELESS = (0x3B671166, 0x41774DAB, 0x955F2AB4, 0x1769A961)
+OTHER = (0x11111111, 0x22222222, 0x33333333, 0x44444444)
+
+load_character(LOVELESS)
+check("the loaded character is identified", jm.refresh_save_id(force=True) == "3B67116641774DAB955F2AB41769A961")
+jm.masher_chance.value = 100
+w1, b1 = make_weapon("JAK_PS", (7, 7, 7, 7))
+jm.process_weapon(w1)
+check("a gun judged on the first save converts", b1.ProjectilesPerShot == 6)
+first_file = jm.registry_path("3B67116641774DAB955F2AB41769A961")
+check("into a file named after that character", first_file.exists(), str(first_file))
+first_saved = __import__("json").loads(first_file.read_text(encoding="utf-8"))
+check("which records the GUID too", first_saved.get("character_guid") == "3B67116641774DAB955F2AB41769A961")
+
+# Back to the menu, load another character: the same parts are judged afresh.
+jm.restore_all()
+load_character(OTHER)
+jm.masher_chance.value = 0
+w2, b2 = make_weapon("JAK_PS", (7, 7, 7, 7))
+jm.scan_all()
+check("a different save judges the same parts on its own", b2.ProjectilesPerShot == 1)
+check("in its own file", jm.registry_path("11111111222222223333333344444444").exists())
+check(
+    "leaving the first save's record alone",
+    __import__("json").loads(first_file.read_text(encoding="utf-8"))["guns"] == first_saved["guns"],
+)
+
+# And back again: the first character's verdict is still there.
+jm.restore_all()
+load_character(LOVELESS)
+w3, b3 = make_weapon("JAK_PS", (7, 7, 7, 7))
+jm.scan_all()
+check("returning to the first save restores its verdict", b3.ProjectilesPerShot == 6)
+
+# A holder that is destroyed and rebuilt is found again.
+jm._save_source[0].kill()
+_profile["obj"] = None
+load_character(OTHER)
+check("a rebuilt profile is found again", jm.refresh_save_id(force=True) == "11111111222222223333333344444444")
+load_character(LOVELESS)
+jm.refresh_save_id(force=True)
+
+# 'masher forget' only forgets the loaded save.
+buf_s = __import__("io").StringIO()
+with __import__("contextlib").redirect_stdout(buf_s):
+    env.sys.modules["mods_base"].REGISTERED["commands"][0]("forget")
+check(
+    "forget leaves other saves alone",
+    __import__("json").loads(jm.registry_path("11111111222222223333333344444444").read_text(encoding="utf-8"))["guns"],
+)
+
+# The holder is found wherever it lives, and remembered.
+reset_mod()
+_profile["obj"] = None
+pc, pawn = make_player()
+pc._props["ActiveCharGuid"] = env.WrappedStruct(A=OTHER[0], B=OTHER[1], C=OTHER[2], D=OTHER[3])
+check("a GUID on the player controller is found", jm.refresh_save_id(force=True) == "11111111222222223333333344444444")
+check("and its holder remembered", jm._save_source is not None and jm._save_source[2] == "PlayerController.ActiveCharGuid", str(jm._save_source))
+env.set_player(None)
+
+# No holder at all: one shared record, reported once, searched rarely.
+reset_mod()
+buf_u = __import__("io").StringIO()
+with __import__("contextlib").redirect_stdout(buf_u):
+    first = jm.refresh_save_id()
+    for _ in range(5):
+        jm.refresh_save_id()
+check("unidentified saves share one record", first == jm.UNKNOWN_SAVE_ID)
+check("reported once", buf_u.getvalue().count("cannot tell which character") == 1, buf_u.getvalue())
+searches = {"n": 0}
+real_holders = jm._save_id_holders
+jm._save_id_holders = lambda: searches.__setitem__("n", searches["n"] + 1) or []
+for _ in range(20):
+    jm.refresh_save_id()
+jm._save_id_holders = real_holders
+check("and not searched for on every sweep", searches["n"] == 0, str(searches["n"]))
+
+# The old shared record moves into the first save identified.
+reset_mod()
+_profile["obj"] = None
+legacy = jm.registry_dir().parent / jm.LEGACY_REGISTRY_FILE_NAME
+legacy.write_text(__import__("json").dumps({"version": 1, "guns": {"parts:1,0,2,2": {"masher": True, "roll": 23.43, "chance": 25, "decided": "2026-09-29"}}}), encoding="utf-8")
+load_character(LOVELESS)
+jm.refresh_save_id(force=True)
+adopted = jm.load_registry()
+check("the old shared record is adopted by the loaded save", adopted.get("parts:1,0,2,2", {}).get("masher") is True, str(adopted))
+check("and moved aside, not deleted", not legacy.exists() and legacy.with_name(legacy.name + ".migrated").exists())
+check("and written into the save's own file", jm.registry_path().exists())
 
 # Turning 'Player Weapons Only' on reverts revolvers that are not yours.
 reset_mod()
@@ -1189,14 +1317,24 @@ real_find_all = jm.unrealsdk.find_all
 
 def counting(*a, **kw):
     calls["n"] += 1
+    calls.setdefault("classes", []).append(a[0] if a else kw.get("cls_name"))
     return real_find_all(*a, **kw)
 
 
 reset_mod()
 jm.unrealsdk.find_all = counting
 jm.scan_all()
+fire_walks = calls["classes"].count(jm.FIRE_BEHAVIOUR_CLASS)
+check("scan_all enumerates the fire behaviours once", fire_walks == 1, f"{fire_walks} scans")
+
+# The save lookup walks the list too, but only until the character's GUID is
+# found - and while it cannot be, at most every SAVE_LOOKUP_RETRY_SECONDS.
+calls["classes"].clear()
+for _ in range(10):
+    jm.scan_all()
+save_walks = len(calls["classes"]) - calls["classes"].count(jm.FIRE_BEHAVIOUR_CLASS)
+check("an unidentified save is not searched for on every sweep", save_walks == 0, f"{save_walks} walks")
 jm.unrealsdk.find_all = real_find_all
-check("scan_all enumerates the object list once", calls["n"] == 1, f"{calls['n']} scans")
 
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
@@ -1339,7 +1477,7 @@ check("scan keybind registered", len(kbs) == 1 and kbs[0].name == "Scan Weapons 
 
 cmds = env.sys.modules["mods_base"].REGISTERED["commands"]
 check("masher command registered", len(cmds) == 1 and cmds[0].cmd == "masher")
-for action in ("dump", "status", "scan", "mine", "probe", "restore", "forget"):
+for action in ("dump", "status", "scan", "mine", "probe", "restore", "forget", "save"):
     try:
         cmds[0](action)
         check(f"'masher {action}' runs", True)

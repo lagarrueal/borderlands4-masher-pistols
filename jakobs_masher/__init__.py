@@ -42,7 +42,7 @@ from mods_base import (
 from unrealsdk.hooks import Type
 from unrealsdk.unreal import BoundFunction, UObject, WeakPointer, WrappedStruct
 
-__version__ = "1.2"
+__version__ = "1.3"
 __author__ = "Claude"
 
 # --------------------------------------------------------------------------- #
@@ -612,13 +612,17 @@ def rolls_masher(weapon: UObject, behaviours: list[UObject]) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Remembering the verdict
+# Remembering the verdict, per save
 #
 # A gun is judged once, the first time the mod sees it in your hands, against
 # the chance at that moment, and the verdict is written down. Later changes to
 # `Masher Chance` only affect guns found afterwards, and neither a restart nor
 # a mod update can flip a gun you already own. Nothing goes into the game's
-# save: this is the mod's own file, beside its settings.
+# save: these are the mod's own files, beside its settings.
+#
+# Each save gets its own record, named after the character GUID the save
+# stores (`char_guid` in a decrypted .sav), so characters never share verdicts
+# and each file only holds one character's guns.
 #
 # Guns are known by their part values, the numbers the item serial stores.
 # Two revolvers built from identical parts are the same gun as far as anything
@@ -631,60 +635,226 @@ try:
 except Exception:  # pragma: no cover - depends on the mods_base build
     _SETTINGS_DIR = Path(__file__).resolve().parent.parent / "settings"
 
-REGISTRY_FILE_NAME = "jakobs_masher_guns.json"
-REGISTRY_VERSION = 1
+REGISTRY_DIR_NAME = "jakobs_masher_guns"
+REGISTRY_VERSION = 2
+
+# Before 1.3 every save shared one file. It is adopted by the first save that
+# is identified, since that is the character the verdicts came from.
+LEGACY_REGISTRY_FILE_NAME = "jakobs_masher_guns.json"
+
+# The record used when the loaded character cannot be identified.
+UNKNOWN_SAVE_ID = "unknown-character"
 
 # Keys with this prefix are judged once per session but never written: they
 # come from the stat fingerprint, which temporary buffs can move, so a
 # remembered verdict could not be found again reliably.
 SESSION_KEY_PREFIX = "session:"
 
-# Key -> {"masher": bool, "roll": float | None, "chance": int, "decided": str}.
-# None until first loaded from disk.
-_registry: dict[str, dict[str, Any]] | None = None
+# Save id -> (key -> {"masher", "roll", "chance", "decided"}), loaded lazily.
+_registries: dict[str, dict[str, dict[str, Any]]] = {}
 
-# Set when the file exists but cannot be read: it is then never overwritten,
-# so a hand-edit gone wrong loses nothing. `masher forget` clears it.
-_registry_unreadable = False
-
-
-def registry_path() -> Path:
-    return Path(_SETTINGS_DIR) / REGISTRY_FILE_NAME
+# Saves whose file exists but cannot be read: never overwritten, so a
+# hand-edit gone wrong loses nothing. `masher forget` clears the flag.
+_unreadable_saves: set[str] = set()
 
 
-def load_registry() -> dict[str, dict[str, Any]]:
-    global _registry, _registry_unreadable
-    if _registry is not None:
-        return _registry
-    _registry = {}
-    path = registry_path()
+# --- which save is loaded ------------------------------------------------- #
+#
+# The GUID is read from the live game. Neither the class that holds it nor the
+# exact property is known from offline data - only that the names
+# `ActiveCharGuid` and `CharacterGuid` exist in the binary - so every plausible
+# holder is tried once and the one that answers is remembered, the same way the
+# ownership link is discovered.
+
+SAVE_ID_FIELDS = ("ActiveCharGuid", "CharacterGuid")
+
+# How long to wait before searching again after no holder answered. A search
+# walks the object list, so it must not run on every sweep in the main menu.
+SAVE_LOOKUP_RETRY_SECONDS = 10.0
+
+# (holder, field, description) that answered last time.
+_save_source: tuple[WeakPointer, str, str] | None = None
+_current_save: str | None = None
+_next_save_lookup = 0.0
+_save_fallback_reported = False
+
+
+def _format_guid(value: Any) -> str | None:
+    """A GUID as the save file writes it: 32 upper-case hex digits.
+
+    None for anything that is not a GUID, or for the all-zero GUID the game
+    holds while no character is loaded.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = re.sub(r"[^0-9A-Fa-f]", "", value).upper()
+        return text if len(text) == 32 and text.strip("0") else None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        guns = data["guns"]
-        if not isinstance(guns, dict):
-            raise ValueError("'guns' is not an object")
-    except FileNotFoundError:
-        return _registry
+        parts = [int(getattr(value, name)) & 0xFFFFFFFF for name in ("A", "B", "C", "D")]
+    except Exception:
+        return None
+    if not any(parts):
+        return None
+    return "".join(f"{part:08X}" for part in parts)
+
+
+def _save_id_holders() -> list[tuple[str, UObject]]:
+    """Every object that might hold the loaded character's GUID."""
+    holders: list[tuple[str, UObject]] = []
+    for class_name in ("OakActiveProfile", "GbxActiveProfile"):
+        try:
+            for obj in unrealsdk.find_all(class_name, False):
+                if obj != obj.Class.ClassDefaultObject:
+                    holders.append((class_name, obj))
+        except Exception:
+            continue
+    try:
+        pc = get_pc()
+    except Exception:
+        pc = None
+    if pc is not None:
+        holders.append(("PlayerController", pc))
+        for field, label in (("PlayerState", "PlayerState"), ("Player", "LocalPlayer")):
+            try:
+                linked = getattr(pc, field)
+            except Exception:
+                continue
+            if linked is not None:
+                holders.append((label, linked))
+    return holders
+
+
+def _read_save_guid() -> str | None:
+    global _save_source
+    if _save_source is not None:
+        pointer, field, _label = _save_source
+        holder = pointer()
+        if holder is not None:
+            try:
+                guid = _format_guid(getattr(holder, field))
+            except Exception:
+                guid = None
+            if guid:
+                return guid
+        _save_source = None
+
+    for label, holder in _save_id_holders():
+        for field in SAVE_ID_FIELDS:
+            try:
+                guid = _format_guid(getattr(holder, field))
+            except Exception:
+                continue
+            if guid:
+                _save_source = (WeakPointer(holder), field, f"{label}.{field}")
+                log(f"saves told apart by {label}.{field} (character {guid})")
+                return guid
+    return None
+
+
+def refresh_save_id(force: bool = False) -> str:
+    """Work out which save is loaded. Cheap once the GUID's holder is known."""
+    global _current_save, _next_save_lookup, _save_fallback_reported
+    now = time.monotonic()
+    if _save_source is None and not force and now < _next_save_lookup:
+        return _current_save or UNKNOWN_SAVE_ID
+
+    guid = _read_save_guid()
+    if guid is None:
+        _next_save_lookup = now + SAVE_LOOKUP_RETRY_SECONDS
+        if _current_save is None and not _save_fallback_reported:
+            _save_fallback_reported = True
+            log(
+                "cannot tell which character is loaded yet - verdicts go to a"
+                f" shared '{UNKNOWN_SAVE_ID}' record until it can ('masher save' shows why)"
+            )
+        return _current_save or UNKNOWN_SAVE_ID
+
+    if guid != _current_save:
+        if _current_save is not None:
+            log(f"character changed: {_current_save} -> {guid}")
+        _current_save = guid
+    return guid
+
+
+def current_save_id() -> str:
+    return _current_save or refresh_save_id()
+
+
+# --- the record files ----------------------------------------------------- #
+
+
+def registry_dir() -> Path:
+    return Path(_SETTINGS_DIR) / REGISTRY_DIR_NAME
+
+
+def registry_path(save_id: str | None = None) -> Path:
+    return registry_dir() / f"{save_id or current_save_id()}.json"
+
+
+def _read_guns(path: Path) -> dict[str, dict[str, Any]]:
+    """Parse a record file. Raises on anything malformed."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    guns = data["guns"]
+    if not isinstance(guns, dict):
+        raise ValueError("'guns' is not an object")
+    return {
+        key: entry
+        for key, entry in guns.items()
+        if isinstance(entry, dict) and isinstance(entry.get("masher"), bool)
+    }
+
+
+def _adopt_legacy_record(save_id: str, registry: dict[str, dict[str, Any]]) -> None:
+    """Move the pre-1.3 shared record into the first save that is identified."""
+    legacy = Path(_SETTINGS_DIR) / LEGACY_REGISTRY_FILE_NAME
+    if save_id == UNKNOWN_SAVE_ID or not legacy.exists():
+        return
+    try:
+        registry.update(_read_guns(legacy))
+        legacy.replace(legacy.with_name(legacy.name + ".migrated"))
     except Exception as exc:
-        _registry_unreadable = True
+        log(f"could not adopt the old shared record {legacy}: {exc}")
+        return
+    log(f"adopted {len(registry)} verdict(s) from the old shared record into {save_id}")
+    save_registry(save_id)
+
+
+def load_registry(save_id: str | None = None) -> dict[str, dict[str, Any]]:
+    save_id = save_id or current_save_id()
+    registry = _registries.get(save_id)
+    if registry is not None:
+        return registry
+    registry = _registries[save_id] = {}
+    path = registry_path(save_id)
+    try:
+        registry.update(_read_guns(path))
+    except FileNotFoundError:
+        _adopt_legacy_record(save_id, registry)
+        return registry
+    except Exception as exc:
+        _unreadable_saves.add(save_id)
         log(
             f"could not read {path} ({exc}). It will not be overwritten;"
             " guns are judged for this session only. 'masher forget' resets it."
         )
-        return _registry
-    for key, entry in guns.items():
-        if isinstance(entry, dict) and isinstance(entry.get("masher"), bool):
-            _registry[key] = entry
-    debug(f"remembered verdicts loaded: {len(_registry)}")
-    return _registry
+        return registry
+    debug(f"remembered verdicts loaded for {save_id}: {len(registry)}")
+    return registry
 
 
-def save_registry() -> None:
-    if _registry is None or _registry_unreadable:
+def save_registry(save_id: str | None = None) -> None:
+    save_id = save_id or current_save_id()
+    registry = _registries.get(save_id)
+    if registry is None or save_id in _unreadable_saves:
         return
-    path = registry_path()
-    persisted = {k: v for k, v in _registry.items() if not k.startswith(SESSION_KEY_PREFIX)}
-    body = json.dumps({"version": REGISTRY_VERSION, "guns": persisted}, indent=1, sort_keys=True)
+    path = registry_path(save_id)
+    persisted = {k: v for k, v in registry.items() if not k.startswith(SESSION_KEY_PREFIX)}
+    body = json.dumps(
+        {"version": REGISTRY_VERSION, "character_guid": save_id, "guns": persisted},
+        indent=1,
+        sort_keys=True,
+    )
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(path.name + ".tmp")
@@ -692,6 +862,10 @@ def save_registry() -> None:
         temp.replace(path)
     except Exception as exc:
         log(f"could not save {path}: {exc}")
+
+
+def remembered_count(save_id: str | None = None) -> int:
+    return sum(1 for k in load_registry(save_id) if not k.startswith(SESSION_KEY_PREFIX))
 
 
 def gun_key(source: str, identity: tuple[int, ...]) -> str | None:
@@ -730,13 +904,12 @@ def decide(key: str | None, roll: float | None) -> tuple[bool, bool]:
 
 
 def forget_all() -> int:
-    """Drop every remembered verdict. Returns how many were written down."""
-    global _registry_unreadable
-    registry = load_registry()
-    count = sum(1 for k in registry if not k.startswith(SESSION_KEY_PREFIX))
-    registry.clear()
-    _registry_unreadable = False
-    save_registry()
+    """Drop the loaded save's remembered verdicts. Returns how many were written."""
+    save_id = current_save_id()
+    count = remembered_count(save_id)
+    load_registry(save_id).clear()
+    _unreadable_saves.discard(save_id)
+    save_registry(save_id)
     return count
 
 
@@ -1233,6 +1406,7 @@ def scan_all() -> int:
 
     This is what the keybind and `masher scan` use.
     """
+    refresh_save_id()
     by_weapon = live_weapons()
 
     for weapon, behaviours in by_weapon.values():
@@ -1655,8 +1829,7 @@ def on_mod_enabled() -> None:
     log(f"enabled - {int(projectiles.value)} projectiles at "
         f"{float(damage_scale.value):.2f}x damage, "
         f"{int(masher_chance.value)}% of newly found Jakobs revolvers,"
-        f" {sum(1 for k in load_registry() if not k.startswith(SESSION_KEY_PREFIX))}"
-        " guns remembered")
+        " one record per save")
     log(f"hooks bound: {', '.join(bound) if bound else 'NONE'}")
     if unbound:
         log(f"hooks NOT bound: {', '.join(unbound)}")
@@ -1719,10 +1892,14 @@ def masher_command(args: Any) -> None:
                 log(f"  not a Jakobs pistol  {path}")
                 continue
             log(f"  {describe_decision(key, roll)}  behaviours={len(pointers)}  {path}")
-        remembered = sum(1 for k in load_registry() if not k.startswith(SESSION_KEY_PREFIX))
+        save_id = refresh_save_id(force=True)
         log(
-            f"remembered verdicts: {remembered} in {registry_path()}"
-            + ("  (UNREADABLE - not being saved)" if _registry_unreadable else "")
+            f"loaded save: {save_id}"
+            + (f" (via {_save_source[2]})" if _save_source else " (not identified)")
+        )
+        log(
+            f"remembered verdicts: {remembered_count(save_id)} in {registry_path(save_id)}"
+            + ("  (UNREADABLE - not being saved)" if save_id in _unreadable_saves else "")
         )
         return
 
@@ -1732,6 +1909,7 @@ def masher_command(args: Any) -> None:
         return
 
     if args.action == "mine":
+        refresh_save_id(force=True)
         # Weapons have no readable display name, so the next best answer to
         # "which of my guns is a Masher" is to list them with their live
         # projectile count - that is the number the effect actually changes.
@@ -1873,13 +2051,40 @@ def masher_command(args: Any) -> None:
         restore_all()
         return
 
+    if args.action == "save":
+        # Which save is loaded, and every candidate that was asked. When the
+        # saves cannot be told apart, this is the output to report.
+        save_id = refresh_save_id(force=True)
+        log(f"loaded save: {save_id}")
+        log(f"record file: {registry_path(save_id)}  ({remembered_count(save_id)} gun(s))")
+        for label, holder in _save_id_holders():
+            try:
+                where = f"{holder.Class.Name} {holder._path_name()}"
+            except Exception:
+                where = "?"
+            log(f"  {label}: {where}")
+            for field in SAVE_ID_FIELDS:
+                try:
+                    raw = getattr(holder, field)
+                except Exception as exc:
+                    log(f"      {field}: not a property ({type(exc).__name__})")
+                    continue
+                log(f"      {field} = {_describe(raw)[:120]} -> {_format_guid(raw)}")
+        try:
+            others = sorted(p.stem for p in registry_dir().glob("*.json"))
+        except Exception:
+            others = []
+        log(f"records on disk: {', '.join(others) or 'none'}")
+        return
+
     if args.action == "forget":
         # Re-judge everything at the current chance: revert, forget, sweep.
+        refresh_save_id(force=True)
         count = forget_all()
         restore_all()
         maybe_scan("forget", force=True)
         log(
-            f"forgot {count} remembered gun(s); what you carry was judged again"
+            f"forgot {count} remembered gun(s) for this save; what you carry was judged again"
             f" at {int(masher_chance.value)}%"
         )
         return
@@ -1964,12 +2169,12 @@ masher_command.add_argument(
     "action",
     nargs="?",
     default="dump",
-    choices=("dump", "status", "scan", "mine", "probe", "restore", "forget"),
+    choices=("dump", "status", "scan", "mine", "probe", "restore", "forget", "save"),
     help=(
         "dump the live weapon data, show mod status and hook activity,"
         " scan every loaded weapon now, list the guns you are carrying,"
-        " probe them in full, undo all changes, or forget every remembered"
-        " verdict and judge your guns again at the current chance"
+        " probe them in full, undo all changes, forget this save's remembered"
+        " verdicts and judge your guns again, or show which save is loaded"
     ),
 )
 

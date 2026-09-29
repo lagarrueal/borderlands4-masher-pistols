@@ -93,10 +93,18 @@ verdict is written down. From then on it never changes:
   not rolled again;
 - **mod updates don't either**, even if they change how rolls are computed.
 
-The record is the mod's own file,
-`sdk_mods/settings/jakobs_masher_guns.json`. **Nothing is written to your
-save.** Delete that file, or run `masher forget`, to judge every gun again at
-the current chance.
+**Each save has its own record**, in
+`sdk_mods/settings/jakobs_masher_guns/<character GUID>.json`. The GUID is the
+`char_guid` stored in the save itself, read from the running game, so
+characters never share verdicts. **Nothing is written to your save.** Delete a
+character's file, or run `masher forget` while playing it, to judge that
+character's guns again at the current chance. `masher save` shows which
+character is loaded and which file it uses.
+
+If the loaded character cannot be identified, verdicts go to a shared
+`unknown-character.json` and the log says so once. Upgrading from 1.2 moves the
+old single `jakobs_masher_guns.json` into the first character you load; the old
+file is kept as `.migrated`.
 
 Guns are recognised by their **part values**, the numbers the game's item
 serial stores. Measured in game, two different revolvers read
@@ -163,7 +171,8 @@ masher scan      # apply to every loaded weapon now, ignoring hooks
 masher mine      # list the guns you are carrying, and which are Mashers
 masher probe     # full dump of those guns: every struct field and its value
 masher restore   # undo every change without disabling the mod
-masher forget    # forget every remembered verdict; judge your guns again
+masher forget    # forget this save's verdicts; judge your guns again
+masher save      # which character is loaded, and its record file
 ```
 
 ## Why this is a runtime mod and not a new weapon part
@@ -195,7 +204,7 @@ See [CLAUDE.md](CLAUDE.md) for how that object was located.
 python tests/test_masher.py
 ```
 
-180 checks against a fake engine (`tests/fake_engine.py`) that models the parts
+204 checks against a fake engine (`tests/fake_engine.py`) that models the parts
 of the SDK the mod touches — unreal objects with properties, structs, arrays
 and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 `mods_base` decorators.
@@ -203,7 +212,7 @@ and an `Outer` chain, class default objects, `find_all`, weak pointers, and the
 Covers Jakobs-pistol detection through nested objects, arrays and reference
 cycles; explicit tags outranking the directory heuristic; ownership filtering;
 knobs resolving to whichever property the engine actually exposes, including
-values hidden behind attribute structs; roll stability and distribution at any chance; verdicts judged once and remembered across chance changes and restarts; `masher forget`; an unreadable record never being overwritten; the input heartbeat falling back to a key list; damage not compounding across repeated shots; buffs
+values hidden behind attribute structs; roll stability and distribution at any chance; verdicts judged once and remembered across chance changes and restarts; one record per save, found through whichever object holds the character GUID; the old shared record being adopted; `masher forget` touching only the loaded save; an unreadable record never being overwritten; the input heartbeat falling back to a key list; damage not compounding across repeated shots; buffs
 surviving a rescale; clean restore; caching; hook fire counting; and graceful
 degradation when properties are missing.
 

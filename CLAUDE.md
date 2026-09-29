@@ -261,9 +261,32 @@ and the verdicts were loaded from the record (`remembered verdicts loaded: 3`).
 The per-key heartbeat registered 66 keys and converted the equipped Masher on
 the first key press after loading.
 
-The record is **per install, not per save or character**: the key is the parts
-alone. A gun with identical parts gets the same verdict on every character,
-which is consistent with identical parts meaning the same gun.
+### One record per save (1.3)
+
+Asked for by the user, 2026-09-29. Saves are
+`Documents/My Games/Borderlands 4/Saved/SaveGames/<steamid>/Profiles/client/N.sav`.
+Decrypting one with `tools/bl4.exe save N.sav -s <steamid> decrypt` shows
+`state.char_guid: 3B67116641774DAB955F2AB41769A961` (32 hex digits) and
+`char_name`, so the GUID is the stable per-save identity. Slot numbers and file
+times were rejected: nothing at runtime names the slot, and the game writes the
+file on quit, so mtime points at the previous character.
+
+The binary contains the property names `ActiveCharGuid` and `CharacterGuid`,
+but offline data does not say which class carries them (`GetSaveSlotName` is
+stock UE `LocalPlayerSaveGame`, which BL4 does not appear to use).
+`_read_save_guid()` therefore tries both fields on `OakActiveProfile`,
+`GbxActiveProfile`, the player controller, its `PlayerState` and its
+`LocalPlayer`, keeps a weak pointer to whichever answers, and re-reads only
+that field on later sweeps, so a character switch is seen without searching
+again. Until something answers, a search runs at most every 10s, and verdicts
+go to `unknown-character.json`. **Unverified in game:** which holder answers.
+`masher save` prints every candidate and its value.
+
+`FGuid` members are read as `A, B, C, D` and formatted `%08X` each (unsigned),
+which is how the save writes `char_guid`. An all-zero GUID means no character
+is loaded. Files: `settings/jakobs_masher_guns/<GUID>.json`, carrying
+`character_guid`. The pre-1.3 shared file is adopted by the first identified
+save and renamed `.migrated`.
 
 ### Ownership must never be cached as a no
 
