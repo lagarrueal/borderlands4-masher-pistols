@@ -708,3 +708,19 @@ character.
 Full auto ("double shots") came from renaming away `automaticburstcount: 1`,
 which is what keeps a Jakobs pistol semi-auto. The build now renames
 `bautoburst` (`false`, already the default) instead.
+
+### Working (2026-09-29)
+
+The full pak (`pak/build_masher_pak.py`, three files from the W20 sources)
+was verified in game on Loveless:
+- Mukis read **"… Masher"**, so a new localization key with unknown GUID falls
+  back to the source text;
+- the card damage dropped to 0.4× and reads `N x 6`;
+- the spread is visibly wider;
+- it fires semi-auto;
+- all 13 type-402 class mods are present;
+- the decrypted save is identical before and after (backpack 65, equipped 9,
+  Lost Loot 6).
+
+The pak is now the primary version; the SDK mod is kept and disabled.
+

@@ -9,7 +9,56 @@ them; BL4 does not. This adds them back.
 No new art and no new legendary — it reuses the Jakobs pistols already in the
 game, so a Masher looks exactly like the revolver it is.
 
-## Install
+There are two versions. **Use the pak.**
+
+| | Pak (`pak/`) | SDK mod (`jakobs_masher/`) |
+|---|---|---|
+| Item card | **`91 x 6`**, name **"… Masher"** | unchanged; use `masher mine` |
+| Which guns | every Jakobs pistol with **barrel 02** (formerly "… Muki") | a configurable share, judged per save |
+| Decided | by the game, at drop; stored in the serial | by the mod, on first sight |
+| Needs | nothing but the pak | the Oak2 SDK |
+| After a game patch | **rebuild required** (see below) | keeps working |
+
+## The pak
+
+Barrel 02 of the Jakobs pistol becomes a Masher barrel, like BL3's: 6
+projectiles, each at 0.4× the barrel's damage (2.4× per trigger pull), 3×
+the spread, and the name part "Muki" becomes "Masher". The card shows it,
+because the card is built from exactly the data this changes.
+
+```bash
+python pak/build_masher_pak.py --install     # build against the installed game, then install
+python pak/build_masher_pak.py --uninstall   # remove it
+```
+
+It replaces three game data files in `Paks/JakobsMasher_9600_P.*`:
+
+| File | Change |
+|---|---|
+| `Nexus-Data-inv4.ncs` | `part_barrel_02`'s fire behaviour: the field `bautoburst` (`false`, already the default) is renamed `projectilespershot` and set to 6 |
+| `Nexus-Data-gbx_ue_data_table4.ncs` | `Weapon_PS_Barrel_Init / JAK_Barrel_02`: `damage_scale` ×0.4, `spread_value` ×3 |
+| `Nexus-Data-inv_name_part4.ncs` | `np_weap_JAK_PS_B02`'s name: "Muki" → "Masher" |
+
+Only barrel 02 reads that row and that name part, and every other entry in
+the three files is left exactly as the game ships it. The build checks this:
+it decodes each patched file and requires it to equal the original except for
+those cells.
+
+> **Rebuild after every game patch, before playing.** A mod pak replaces whole
+> files, so a stale build silently undoes whatever the patch changed in them.
+> A build from an out-of-date inv4 made the game **delete items** (see
+> [CLAUDE.md](CLAUDE.md)). The build always reads the newest copy the game has
+> installed, so after a patch: uninstall, rebuild, reinstall.
+
+Needs the NCS toolkit from the parent repo (`../scripts`, `../tools/bl4.exe`),
+plus repak and retoc.
+
+## The SDK mod (older)
+
+Kept for reference and for setups without paks. It changes the live weapon,
+so it works across patches, but the card never shows it.
+
+### Install
 
 Requires the [Oak2 mod manager](https://github.com/bl-sdk/oak2-mod-manager)
 (BL4 PythonSDK). Either:
@@ -37,7 +86,7 @@ Mods load at **startup only** — fully exit and relaunch, not just back to menu
 > [jakobs_masher] hooks bound: ServerStartUsing, ServerEquipInterruptible, ...
 > ```
 
-## Settings
+## SDK mod: settings
 
 All are live-adjustable from the mods menu.
 
@@ -128,7 +177,7 @@ mid-pickup, are never judged.
 > Upgrading from 1.0: the old **Masher Frequency (in 4)** setting is not
 > carried over. The new option starts at 25%.
 
-## How it applies itself
+## SDK mod: how it applies itself
 
 Picking a gun up, interacting, or swapping weapons scans immediately. Any
 key press also drives a throttled sweep, and for a few seconds after a pickup
@@ -160,7 +209,7 @@ force a sweep regardless of throttle or settings. If a sweep produces no
 Mashers, `masher dump` prints what the mod can see about each weapon — that
 output is the thing to report.
 
-## Console commands
+## SDK mod: console commands
 
 The console key on this install is **F10**.
 
@@ -175,28 +224,23 @@ masher forget    # forget this save's verdicts; judge your guns again
 masher save      # which character is loaded, and its record file
 ```
 
-## Why this is a runtime mod and not a new weapon part
+## How the pak adds a field the data never had
 
-Worth stating plainly, because the obvious approach does not work.
+This README used to say a pak could not do it. That was wrong, and the reason
+is worth recording.
 
-Weapon parts live in `Nexus-Data-inv4.ncs`, not in Unreal assets. The `jak_ps`
-record lists its barrels — `part_barrel_01`, `part_barrel_02`, and the `_a`–`_d`
-accessory variants — and **none of them set `projectilespershot`**. The records
-that do are shotgun-shaped: `bor_sg`'s barrel is a flat `4.000000`, and others
-read a `Weapon_SG_Underbarrel_Init` data-table row that has no pistol
-equivalent. That absence is the entire reason BL4 has no Masher.
+Weapon parts live in `Nexus-Data-inv4.ncs`. No common Jakobs pistol barrel sets
+`projectilespershot`, which is why BL4 has no Masher. The NCS writer can
+repoint existing values but cannot add fields. However, **every common barrel
+already carries an inline fire behaviour** (spread, damage, fire rate,
+`automaticburstcount`, `bautoburst`), and a field's *name* is just an index
+into the file's key pool. Rewriting that one index renames `bautoburst` to
+`projectilespershot`, and its value is then repointed to `6`. The game reads
+it like any shotgun barrel's pellet count.
 
-Adding one as real data is blocked twice over:
-
-1. It needs **new NCS records**, which needs record-level NCS writing — the same
-   re-encoder wall documented in the parent repo's `CLAUDE.md`. Existing values
-   can be repointed; new keys cannot be added.
-2. Part *behaviour* is **native C++** compiled into the game binary. The NCS is
-   only the registry that names parts and wires them together, so even a
-   successfully injected record would have nothing behind it.
-
-So the variant is applied to the live `WeaponBehavior_FireProjectile` instead.
-See [CLAUDE.md](CLAUDE.md) for how that object was located.
+`automaticburstcount` would have worked too, but its `1` is what keeps a
+Jakobs pistol semi-auto; without it the gun fires full auto. See
+[CLAUDE.md](CLAUDE.md) for the bit layout and the tests.
 
 ## Tests
 
