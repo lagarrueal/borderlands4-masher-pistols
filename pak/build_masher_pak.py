@@ -58,7 +58,12 @@ INV_FILE = "Nexus-Data-inv4.ncs"
 WEAPON = "jak_ps"
 MASHER_BARREL = "part_barrel_02"          # names its guns "... Muki"
 FIRE_ASPECT = "inv_aspect'jak_ps_fire_projectile'"
-RENAMED_KEY = "automaticburstcount"      # "1" on every common JAK_PS barrel
+# The field sacrificed for the new key. Not `automaticburstcount` ("1"): that
+# is what keeps a Jakobs pistol semi-auto, and renaming it away made the
+# Masher fire full auto while the trigger was held. `bautoburst` is "false",
+# which is already the default, so losing it changes nothing.
+RENAMED_KEY = "bautoburst"
+RENAMED_VALUE = "false"
 MASHER_KEY = "projectilespershot"
 PROJECTILES = "6.000000"                  # BL3's Masher barrel fired 6
 # The barrel's damage attribute, which the trace uses to find the barrel.
@@ -189,11 +194,11 @@ def write_bits(buf: bytearray, bitpos: int, value: int, n: int) -> None:
 def find_masher_cells(payload: bytes, lines: list[str]) -> dict:
     """Bit positions (relative to the record data) of the key and value to change.
 
-    The barrel is found by its damage attribute, which only it references. Its
-    `automaticburstcount` value ("1") is the nearest "1" before that. The key
-    naming it is not traced, but it sits in the gap between the previous value
-    and this one: measured on inv4, 9 bits into the gap, 12 bits wide, with 4
-    type bits after. The whole gap is scanned and exactly one match required.
+    The barrel is found by its damage attribute, which only it references. The
+    renamed field's value sits a few values away. Its key is not traced, but
+    it lies in the gap between the previous value and this one (measured on
+    inv4: 9 bits into the gap, 12 bits wide, then 4 type bits). The gap is
+    scanned and exactly one match is required.
     """
     blocks, data_start = string_blocks(payload)
     keys = blocks["key_strings"]
@@ -208,24 +213,30 @@ def find_masher_cells(payload: bytes, lines: list[str]) -> dict:
         raise SystemExit(f"expected 1 reference to {BARREL_DAMAGE_VALUE}, found {len(anchors)}")
     anchor = anchors[0]
 
-    one = next((k for k in range(anchor - 1, max(anchor - 4, 0), -1) if values[k][1].group(5) == "1"), None)
-    if one is None:
-        raise SystemExit(f"no '1' value just before {BARREL_DAMAGE_VALUE}: the layout changed")
-    value_pos = int(values[one][1].group(1))
-    value_bits = int(values[one][1].group(2))
-    previous = values[one - 1][1]
-    gap_start = int(previous.group(1)) + int(previous.group(2))
-
+    # The renamed field's value is near the damage attribute, in the same
+    # behaviour. Take every value equal to RENAMED_VALUE within a small
+    # window, and keep the ones whose gap holds the renamed key exactly once.
     data_bit = data_start * 8
-    hits = [
-        b
-        for b in range(gap_start, value_pos - key_bits + 1)
-        if read_bits(payload, data_bit + b, key_bits) == renamed_index
-    ]
-    if len(hits) != 1:
+    matches = []
+    for k in range(max(anchor - 8, 1), min(anchor + 40, len(values))):
+        m = values[k][1]
+        if m.group(5) != RENAMED_VALUE:
+            continue
+        value_pos, value_bits = int(m.group(1)), int(m.group(2))
+        previous = values[k - 1][1]
+        gap_start = int(previous.group(1)) + int(previous.group(2))
+        hits = [
+            b
+            for b in range(gap_start, value_pos - key_bits + 1)
+            if read_bits(payload, data_bit + b, key_bits) == renamed_index
+        ]
+        if len(hits) == 1:
+            matches.append((hits, value_pos, value_bits, gap_start))
+    if len(matches) != 1:
         raise SystemExit(
-            f"expected exactly 1 '{RENAMED_KEY}' key in the gap {gap_start}..{value_pos}, found {hits}"
+            f"expected exactly 1 '{RENAMED_KEY}: {RENAMED_VALUE}' near {BARREL_DAMAGE_VALUE}, found {len(matches)}"
         )
+    hits, value_pos, value_bits, gap_start = matches[0]
     return {
         "key_pos": hits[0],
         "key_bits": key_bits,
@@ -261,7 +272,7 @@ def verify(original: dict, patched: dict) -> None:
     undone = copy.deepcopy(patched)
     b = barrel_behaviour(undone)
     b.pop(MASHER_KEY)
-    b[RENAMED_KEY] = "1"
+    b[RENAMED_KEY] = RENAMED_VALUE
     if undone != original:
         raise SystemExit("the patch changed something besides the masher barrel")
     print(f"  verified: {MASHER_BARREL} now has {MASHER_KEY}={PROJECTILES}; nothing else in the file changed")
@@ -328,10 +339,28 @@ def build() -> None:
     package(patched)
 
 
+# Where the file goes in the pak.
+#
+# Replacing Engine/Content/_NCS/Nexus-Data-inv4.ncs wholesale made the game
+# hide class mods even when the file was the game's own, byte for byte. So by
+# default the mod uses Gearbox's hotfix path instead: the online patch pak
+# ships partial files there (OakGame/_PATCH/PAK/_NCS/Nexus-Data-challenge.ncs
+# holds 385 of challenge0's 2415 entries), merged entry by entry over the base
+# data. The base inv4 then stays untouched in its own pak.
+PATCH_ROUTE = "--replace" not in sys.argv
+PATCH_FILE = "Nexus-Data-inv.ncs"  # hotfix files carry no chunk number
+
+
+def ncs_destination(root: Path) -> Path:
+    if PATCH_ROUTE:
+        return root / "OakGame" / "_PATCH" / "PAK" / "_NCS" / PATCH_FILE
+    return root / "Engine" / "Content" / "_NCS" / INV_FILE
+
+
 def package(patched: Path) -> None:
     root = BUILD / "_modroot"
     shutil.rmtree(root, ignore_errors=True)
-    store(patched, root / "Engine" / "Content" / "_NCS" / INV_FILE)
+    store(patched, ncs_destination(root))
     pack_root(root)
 
 
@@ -339,8 +368,8 @@ def package_file(ncs_file: Path) -> None:
     """Pack an already-complete .ncs file (header included) unchanged."""
     root = BUILD / "_modroot"
     shutil.rmtree(root, ignore_errors=True)
-    dest = root / "Engine" / "Content" / "_NCS" / INV_FILE
-    dest.parent.mkdir(parents=True)
+    dest = ncs_destination(root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(ncs_file, dest)
     pack_root(root)
 
